@@ -111,7 +111,9 @@ module ibex_fetch_fifo #(
   ////////////////////////////////////////
 
   always_comb begin
-    if (out_addr_o[1]) begin
+    // when using TestRIG, the instruction data that is read in is always
+    // aligned regardless of what the fetch was
+    if (0) begin //if (out_addr_o[1]) begin
       // unaligned case
       out_rdata_o     = rdata_unaligned;
       out_err_o       = err_unaligned;
@@ -139,8 +141,11 @@ module ibex_fetch_fifo #(
   assign instr_addr_en = clear_i | (out_ready_i & out_valid_o);
 
   // Increment the address by two every time a compressed instruction is popped
-  assign addr_incr_two = instr_addr_q[1] ? unaligned_is_compressed :
-                                           aligned_is_compressed;
+  // When using TestRIG, the instruction is always aligned and in the bottom
+  // bits of the read data, so only use the aligned signal
+  //assign addr_incr_two = instr_addr_q[1] ? unaligned_is_compressed :
+  //                                         aligned_is_compressed;
+  assign addr_incr_two = aligned_is_compressed;
 
   assign instr_addr_next = (instr_addr_q[31:1] +
                             // Increment address by 4 or 2

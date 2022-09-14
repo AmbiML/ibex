@@ -103,6 +103,7 @@ module ibex_controller #(
   input  logic                  ready_wb_i,
 
   // performance monitors
+  output logic                  perf_xret_o,             // we are executing an xRET
   output logic                  perf_jump_o,             // we are executing a jump
                                                          // instruction (j, jr, jal, jalr)
   output logic                  perf_tbranch_o           // we are executing a taken branch
@@ -457,6 +458,7 @@ module ibex_controller #(
     debug_mode_d           = debug_mode_q;
     nmi_mode_d             = nmi_mode_q;
 
+    perf_xret_o            = 1'b0;
     perf_tbranch_o         = 1'b0;
     perf_jump_o            = 1'b0;
 
@@ -793,6 +795,7 @@ module ibex_controller #(
             pc_mux_o              = PC_ERET;
             pc_set_o              = 1'b1;
             csr_restore_mret_id_o = 1'b1;
+            perf_xret_o           = 1'b1;
             if (nmi_mode_q) begin
               nmi_mode_d          = 1'b0; // exit NMI mode
             end
@@ -801,6 +804,7 @@ module ibex_controller #(
             pc_set_o              = 1'b1;
             debug_mode_d          = 1'b0;
             csr_restore_dret_id_o = 1'b1;
+            perf_xret_o           = 1'b1;
           end else if (wfi_insn) begin
             ctrl_fsm_ns           = WAIT_SLEEP;
           end else if (csr_pipe_flush && handle_irq) begin

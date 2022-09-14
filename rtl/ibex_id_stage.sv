@@ -175,6 +175,7 @@ module ibex_id_stage #(
   input logic                       outstanding_store_wb_i,
 
   // Performance Counters
+  output logic                      perf_xret_o,    // executing an xRET instr
   output logic                      perf_jump_o,    // executing a jump instr
   output logic                      perf_branch_o,  // executing a branch instr
   output logic                      perf_tbranch_o, // executing a taken branch instr
@@ -630,6 +631,7 @@ module ibex_id_stage #(
     .ready_wb_i(ready_wb_i),
 
     // Performance Counters
+    .perf_xret_o   (perf_xret_o),
     .perf_jump_o   (perf_jump_o),
     .perf_tbranch_o(perf_tbranch_o)
   );

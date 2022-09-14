@@ -530,7 +530,7 @@ module ibex_cs_registers #(
     mtvec_en     = csr_mtvec_init_i;
     // mtvec.MODE set to vectored
     // mtvec.BASE must be 256-byte aligned
-    mtvec_d      = csr_mtvec_init_i ? {boot_addr_i[31:8], 6'b0, 2'b01} :
+    mtvec_d      = csr_mtvec_init_i ? 0 : //{boot_addr_i[31:8], 6'b0, 2'b01} :
                                       {csr_wdata_int[31:8], 6'b0, 2'b01};
     dcsr_en      = 1'b0;
     dcsr_d       = dcsr_q;

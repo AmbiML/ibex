@@ -139,6 +139,9 @@ module ibex_core import ibex_pkg::*; #(
   output logic                         rvfi_ext_nmi,
   output logic                         rvfi_ext_debug_req,
   output logic [63:0]                  rvfi_ext_mcycle,
+  output logic                         perf_xret_o,
+  output logic                         perf_jump_o,
+  output logic                         perf_tbranch_o,
 `endif
 
   // CPU Control Signals
@@ -210,6 +213,7 @@ module ibex_core import ibex_pkg::*; #(
   // Jump and branch target and decision (EX->IF)
   logic [31:0] branch_target_ex;
   logic        branch_decision;
+  logic [31:0] if_pc_set_target;
 
   // Core busy signals
   logic        ctrl_busy;
@@ -347,6 +351,7 @@ module ibex_core import ibex_pkg::*; #(
   logic        perf_dside_wait;
   logic        perf_mul_wait;
   logic        perf_div_wait;
+  logic        perf_xret;
   logic        perf_jump;
   logic        perf_branch;
   logic        perf_tbranch;
@@ -446,6 +451,7 @@ module ibex_core import ibex_pkg::*; #(
 
     // branch targets
     .branch_target_ex_i(branch_target_ex),
+    .pc_set_target_o   (if_pc_set_target),
     .nt_branch_addr_i  (nt_branch_addr),
 
     // CSRs
@@ -638,6 +644,7 @@ module ibex_core import ibex_pkg::*; #(
     .outstanding_store_wb_i(outstanding_store_wb),
 
     // Performance Counters
+    .perf_xret_o      (perf_xret),
     .perf_jump_o      (perf_jump),
     .perf_branch_o    (perf_branch),
     .perf_tbranch_o   (perf_tbranch),
@@ -1197,7 +1204,11 @@ module ibex_core import ibex_pkg::*; #(
   assign rvfi_rd_addr   = rvfi_stage_rd_addr  [RVFI_STAGES-1];
   assign rvfi_rd_wdata  = rvfi_stage_rd_wdata [RVFI_STAGES-1];
   assign rvfi_pc_rdata  = rvfi_stage_pc_rdata [RVFI_STAGES-1];
-  assign rvfi_pc_wdata  = rvfi_stage_pc_wdata [RVFI_STAGES-1];
+  // if the PC was set but not by a jump/branch, then we only have the target
+  // PC the cycle after since the controller is in FLUSH state
+  // TODO this is tested for MRET and exceptions, but not with
+  // branch brediction
+  assign rvfi_pc_wdata  = pc_set && (pc_mux_id != PC_JUMP) ? if_pc_set_target : rvfi_stage_pc_wdata [RVFI_STAGES-1];
   assign rvfi_mem_addr  = rvfi_stage_mem_addr [RVFI_STAGES-1];
   assign rvfi_mem_rmask = rvfi_stage_mem_rmask[RVFI_STAGES-1];
   assign rvfi_mem_wmask = rvfi_stage_mem_wmask[RVFI_STAGES-1];
@@ -1396,7 +1407,7 @@ module ibex_core import ibex_pkg::*; #(
             rvfi_stage_rs2_addr[i]        <= rvfi_rs2_addr_d;
             rvfi_stage_rs3_addr[i]        <= rvfi_rs3_addr_d;
             rvfi_stage_pc_rdata[i]        <= pc_id;
-            rvfi_stage_pc_wdata[i]        <= pc_set ? branch_target_ex : pc_if;
+            rvfi_stage_pc_wdata[i]        <= pc_set ? if_pc_set_target : pc_if;
             rvfi_stage_mem_rmask[i]       <= rvfi_mem_mask_int;
             rvfi_stage_mem_wmask[i]       <= data_we_o ? rvfi_mem_mask_int : 4'b0000;
             rvfi_stage_rs1_rdata[i]       <= rvfi_rs1_data_d;
@@ -1598,6 +1609,9 @@ module ibex_core import ibex_pkg::*; #(
     end
   end
 
+  assign perf_xret_o = perf_xret;
+  assign perf_jump_o = perf_jump;
+  assign perf_tbranch_o = perf_tbranch;
 `else
   logic unused_instr_new_id, unused_instr_id_done, unused_instr_done_wb;
   assign unused_instr_id_done = instr_id_done;
