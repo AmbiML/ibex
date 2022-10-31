@@ -37,6 +37,7 @@ module ibex_controller #(
   input  logic                  instr_bp_taken_i,        // instr was predicted taken branch
   input  logic                  instr_fetch_err_i,       // instr has error
   input  logic                  instr_fetch_err_plus2_i, // instr error is x32
+  input  logic                  instr_cheri_err_i,       // instr has CHERI error
   input  logic [31:0]           pc_id_i,                 // instr address
 
   // to IF-ID pipeline stage
@@ -60,8 +61,22 @@ module ibex_controller #(
   input  logic                  load_err_i,
   input  logic                  load_intg_err_i,
   input  logic                  store_err_i,
+  input  logic                  load_misalign_err_i,
+  input  logic                  store_misalign_err_i,
+  input  logic                  lsu_cheri_err_i,
   output logic                  wb_exception_o,          // Instruction in WB taking an exception
   output logic                  id_exception_o,          // Instruction in ID taking an exception
+
+  // CHERI exception signals
+  input  logic                  cheri_en_i,
+  input  logic                  cheri_alu_exc_only_i,
+  input  ibex_pkg::cheri_exc_t  cheri_exceptions_a_ex_i,
+  input  ibex_pkg::cheri_exc_t  cheri_exceptions_b_ex_i,
+  input  ibex_pkg::cheri_exc_t  cheri_exceptions_lsu_i,
+  input  ibex_pkg::cheri_exc_t  cheri_exceptions_if_i,
+  input  logic                  scr_no_asr_i,
+  input  logic                  csr_no_asr_i,
+  input  logic                  mret_no_asr_i,
 
   // jump/branch signals
   input  logic                  branch_set_i,            // branch set signal (branch definitely
@@ -96,6 +111,15 @@ module ibex_controller #(
   output logic [31:0]           csr_mtval_o,
   input  ibex_pkg::priv_lvl_e   priv_mode_i,
 
+  // CHERI exception cause
+  output ibex_pkg::c_exc_cause_e       cheri_exc_cause_o,
+  output ibex_pkg::c_exc_reg_mux_sel_e cheri_exc_reg_sel_o,
+
+  // register addresses (to set mtval on CHERI exception)
+  input  logic [4:0]         rf_raddr_a_i,
+  input  logic [4:0]         rf_raddr_b_i,
+  input  ibex_pkg::scr_num_e scr_addr_i,
+
   // stall & flush signals
   input  logic                  stall_id_i,
   input  logic                  stall_wb_i,
@@ -103,6 +127,7 @@ module ibex_controller #(
   input  logic                  ready_wb_i,
 
   // performance monitors
+  output logic                  perf_xret_o,             // we are executing an xRET
   output logic                  perf_jump_o,             // we are executing a jump
                                                          // instruction (j, jr, jal, jalr)
   output logic                  perf_tbranch_o           // we are executing a taken branch
@@ -116,6 +141,10 @@ module ibex_controller #(
   logic debug_mode_q, debug_mode_d;
   logic load_err_q, load_err_d;
   logic store_err_q, store_err_d;
+  logic load_misalign_err_q, load_misalign_err_d;
+  logic store_misalign_err_q, store_misalign_err_d;
+  logic cheri_lsu_err_q, cheri_lsu_err_d;
+  logic cheri_err_q, cheri_err_d;
   logic exc_req_q, exc_req_d;
   logic illegal_insn_q, illegal_insn_d;
 
@@ -127,6 +156,10 @@ module ibex_controller #(
   logic ebrk_insn_prio;
   logic store_err_prio;
   logic load_err_prio;
+  logic load_misalign_err_prio;
+  logic store_misalign_err_prio;
+  logic cheri_lsu_err_prio;
+  logic cheri_err_prio;
 
   logic stall;
   logic halt_if;
@@ -161,6 +194,7 @@ module ibex_controller #(
   logic ebrk_insn;
   logic csr_pipe_flush;
   logic instr_fetch_err;
+  logic cheri_exc;
 
 `ifndef SYNTHESIS
   // synopsys translate_off
@@ -182,6 +216,10 @@ module ibex_controller #(
 
   assign load_err_d  = load_err_i;
   assign store_err_d = store_err_i;
+  assign load_misalign_err_d = load_misalign_err_i;
+  assign store_misalign_err_d = store_misalign_err_i;
+  assign cheri_lsu_err_d = lsu_cheri_err_i;
+  assign cheri_err_d = cheri_exc;
 
   // Decoder doesn't take instr_valid into account, factor it in here.
   assign ecall_insn      = ecall_insn_i      & instr_valid_i;
@@ -201,16 +239,28 @@ module ibex_controller #(
 
   `ASSERT(IllegalInsnOnlyIfInsnValid, illegal_insn_i |-> instr_valid_i)
 
+  // Signals from decode don't take into account whether the instruction is
+  // valid or not, so filter it here
+  // CHERI exceptions should not be filtered out if:
+  //   they occurred in the ALU and we want to see ALU exceptions
+  //   OR it was an ASR exception and we were checking for ASR exceptions
+  assign cheri_exc = instr_valid_i
+                   & ( ((cheri_en_i | cheri_alu_exc_only_i) & (|cheri_exceptions_a_ex_i | |cheri_exceptions_b_ex_i))
+                     | (scr_no_asr_i)
+                     | (csr_no_asr_i)
+                     | (mret_no_asr_i));
+
+
   // exception requests
   // requests are flopped in exc_req_q.  This is cleared when controller is in
   // the FLUSH state so the cycle following exc_req_q won't remain set for an
   // exception request that has just been handled.
   // All terms in this expression are qualified by instr_valid_i
-  assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err) &
+  assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err | cheri_exc) &
                      (ctrl_fsm_cs != FLUSH);
 
   // LSU exception requests
-  assign exc_req_lsu = store_err_i | load_err_i;
+  assign exc_req_lsu = store_err_i | load_err_i | store_misalign_err_i | load_misalign_err_i | lsu_cheri_err_i;
 
   assign id_exception_o = exc_req_d;
 
@@ -240,14 +290,24 @@ module ibex_controller #(
       ebrk_insn_prio       = 0;
       store_err_prio       = 0;
       load_err_prio        = 0;
+      store_misalign_err_prio = 0;
+      load_misalign_err_prio  = 0;
+      cheri_lsu_err_prio      = 0;
+      cheri_err_prio          = 0;
 
       // Note that with the writeback stage store/load errors occur on the instruction in writeback,
       // all other exception/faults occur on the instruction in ID/EX. The faults from writeback
       // must take priority as that instruction is architecurally ordered before the one in ID/EX.
-      if (store_err_q) begin
+      if (cheri_lsu_err_q) begin
+        cheri_lsu_err_prio = 1'b1;
+      end else if (store_err_q) begin
         store_err_prio = 1'b1;
+      end else if (store_misalign_err_q) begin
+        store_misalign_err_prio = 1'b1;
       end else if (load_err_q) begin
         load_err_prio  = 1'b1;
+      end else if (load_misalign_err_q) begin
+        load_misalign_err_prio = 1'b1;
       end else if (instr_fetch_err) begin
         instr_fetch_err_prio = 1'b1;
       end else if (illegal_insn_q) begin
@@ -256,11 +316,16 @@ module ibex_controller #(
         ecall_insn_prio = 1'b1;
       end else if (ebrk_insn) begin
         ebrk_insn_prio = 1'b1;
+      end else if (cheri_err_q) begin
+        cheri_err_prio = 1'b1;
       end
     end
 
     // Instruction in writeback is generating an exception so instruction in ID must not execute
-    assign wb_exception_o = load_err_q | store_err_q | load_err_i | store_err_i;
+    assign wb_exception_o = load_err_q | store_err_q | cheri_lsu_err_q | cheri_err_q | cheri_exc
+                          | load_err_i | store_err_i | lsu_cheri_err_i
+                          | load_misalign_err_q | load_misalign_err_i
+                          | store_misalign_err_q | store_misalign_err_i;;
   end else begin : g_no_wb_exceptions
     always_comb begin
       instr_fetch_err_prio = 0;
@@ -269,6 +334,10 @@ module ibex_controller #(
       ebrk_insn_prio       = 0;
       store_err_prio       = 0;
       load_err_prio        = 0;
+      store_misalign_err_prio = 0;
+      load_misalign_err_prio  = 0;
+      cheri_lsu_err_prio      = 0;
+      cheri_err_prio          = 0;
 
       if (instr_fetch_err) begin
         instr_fetch_err_prio = 1'b1;
@@ -278,10 +347,18 @@ module ibex_controller #(
         ecall_insn_prio = 1'b1;
       end else if (ebrk_insn) begin
         ebrk_insn_prio = 1'b1;
+      end else if (cheri_lsu_err_q) begin
+        cheri_lsu_err_prio = 1'b1;
       end else if (store_err_q) begin
         store_err_prio = 1'b1;
+      end else if (store_misalign_err_q) begin
+        store_misalign_err_prio = 1'b1;
       end else if (load_err_q) begin
         load_err_prio  = 1'b1;
+      end else if (load_misalign_err_q) begin
+        load_misalign_err_prio = 1'b1;
+      end else if (cheri_err_q) begin
+        cheri_err_prio = 1'b1;
       end
     end
     assign wb_exception_o = 1'b0;
@@ -293,7 +370,11 @@ module ibex_controller #(
                       ecall_insn_prio,
                       ebrk_insn_prio,
                       store_err_prio,
-                      load_err_prio}),
+                      store_misalign_err_prio,
+                      load_err_prio,
+                      load_misalign_err_prio,
+                      cheri_lsu_err_prio,
+                      cheri_err_prio}),
              (ctrl_fsm_cs == FLUSH) & exc_req_q)
 
   ////////////////
@@ -457,6 +538,7 @@ module ibex_controller #(
     debug_mode_d           = debug_mode_q;
     nmi_mode_d             = nmi_mode_q;
 
+    perf_xret_o            = 1'b0;
     perf_tbranch_o         = 1'b0;
     perf_jump_o            = 1'b0;
 
@@ -713,7 +795,8 @@ module ibex_controller #(
 
         // exceptions: set exception PC, save PC and exception cause
         // exc_req_lsu is high for one clock cycle only (in DECODE)
-        if (exc_req_q || store_err_q || load_err_q) begin
+        if (exc_req_q || store_err_q || load_err_q || store_misalign_err_q ||
+            load_misalign_err_q || cheri_lsu_err_q || cheri_err_q) begin
           pc_set_o         = 1'b1;
           pc_mux_o         = PC_EXC;
           exc_pc_mux_o     = debug_mode_q ? EXC_PC_DBG_EXC : EXC_PC_EXC;
@@ -722,8 +805,8 @@ module ibex_controller #(
             // With the writeback stage present whether an instruction accessing memory will cause
             // an exception is only known when it is in writeback. So when taking such an exception
             // epc must come from writeback.
-            csr_save_id_o  = ~(store_err_q | load_err_q);
-            csr_save_wb_o  = store_err_q | load_err_q;
+            csr_save_id_o  = ~(store_err_q | load_err_q | cheri_lsu_err_q);
+            csr_save_wb_o  = ~csr_save_id_o;
           end else begin : g_no_writeback_mepc_save
             csr_save_id_o  = 1'b0;
           end
@@ -733,8 +816,14 @@ module ibex_controller #(
           // Exception/fault prioritisation logic will have set exactly 1 X_prio signal
           unique case (1'b1)
             instr_fetch_err_prio: begin
-              exc_cause_o = ExcCauseInstrAccessFault;
-              csr_mtval_o = instr_fetch_err_plus2_i ? (pc_id_i + 32'd2) : pc_id_i;
+              if (instr_cheri_err_i) begin
+                exc_cause_o       = ExcCauseCheri;
+                csr_mtval_o[10:5] = {1'b1, 5'h0}; // register is PCC
+                csr_mtval_o[4:0]  = cheri_exc_cause_o;
+              end else begin
+                exc_cause_o = ExcCauseInstrAccessFault;
+                csr_mtval_o = instr_fetch_err_plus2_i ? (pc_id_i + 32'd2) : pc_id_i;
+              end
             end
             illegal_insn_prio: begin
               exc_cause_o = ExcCauseIllegalInsn;
@@ -781,9 +870,30 @@ module ibex_controller #(
               exc_cause_o = ExcCauseStoreAccessFault;
               csr_mtval_o = lsu_addr_last_i;
             end
+            store_misalign_err_prio: begin
+              exc_cause_o = ExcCauseStoreAddrMisalign;
+              csr_mtval_o = lsu_addr_last_i;
+            end
             load_err_prio: begin
               exc_cause_o = ExcCauseLoadAccessFault;
               csr_mtval_o = lsu_addr_last_i;
+            end
+            load_misalign_err_prio: begin
+              exc_cause_o = ExcCauseLoadAddrMisalign;
+              csr_mtval_o = lsu_addr_last_i;
+            end
+            cheri_lsu_err_prio: begin
+              exc_cause_o = ExcCauseCheri;
+              csr_mtval_o = lsu_addr_last_i;
+            end
+            cheri_err_prio: begin
+              exc_cause_o = ExcCauseCheri;
+              csr_mtval_o[10:5] = cheri_exc_reg_sel_o == REG_A   ? {1'b0, rf_raddr_a_i}
+                                : cheri_exc_reg_sel_o == REG_B   ? {1'b0, rf_raddr_b_i}
+                                : cheri_exc_reg_sel_o == REG_SCR ? {1'b1, scr_addr_i}
+                                : cheri_exc_reg_sel_o == REG_PCC ? {1'b1, 5'h0}
+                                : 6'h0;
+              csr_mtval_o[4:0]  = cheri_exc_cause_o;
             end
             default: ;
           endcase
@@ -793,6 +903,7 @@ module ibex_controller #(
             pc_mux_o              = PC_ERET;
             pc_set_o              = 1'b1;
             csr_restore_mret_id_o = 1'b1;
+            perf_xret_o           = 1'b1;
             if (nmi_mode_q) begin
               nmi_mode_d          = 1'b0; // exit NMI mode
             end
@@ -801,6 +912,7 @@ module ibex_controller #(
             pc_set_o              = 1'b1;
             debug_mode_d          = 1'b0;
             csr_restore_dret_id_o = 1'b1;
+            perf_xret_o           = 1'b1;
           end else if (wfi_insn) begin
             ctrl_fsm_ns           = WAIT_SLEEP;
           end else if (csr_pipe_flush && handle_irq) begin
@@ -867,6 +979,9 @@ module ibex_controller #(
       enter_debug_mode_prio_q <= 1'b0;
       load_err_q              <= 1'b0;
       store_err_q             <= 1'b0;
+      load_misalign_err_q     <= 1'b0;
+      store_misalign_err_q    <= 1'b0;
+      cheri_lsu_err_q         <= 1'b0;
       exc_req_q               <= 1'b0;
       illegal_insn_q          <= 1'b0;
     end else begin
@@ -877,8 +992,167 @@ module ibex_controller #(
       enter_debug_mode_prio_q <= enter_debug_mode_prio_d;
       load_err_q              <= load_err_d;
       store_err_q             <= store_err_d;
+      load_misalign_err_q     <= load_misalign_err_d;
+      store_misalign_err_q    <= store_misalign_err_d;
+      cheri_lsu_err_q         <= cheri_lsu_err_d;
+      cheri_err_q             <= cheri_err_d;
       exc_req_q               <= exc_req_d;
       illegal_insn_q          <= illegal_insn_d;
+    end
+  end
+
+  ///////////////////////////
+  // CHERI Exception Cause //
+  ///////////////////////////
+
+  always_comb begin
+    cheri_exc_cause_o   = CAUSE_NONE;
+    cheri_exc_reg_sel_o = REG_A;
+
+    if (scr_no_asr_i | csr_no_asr_i | mret_no_asr_i) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_ACCESS_SYSTEM_REGISTERS_VIOLATION;
+      cheri_exc_reg_sel_o = REG_SCR;
+
+    end else if (cheri_exceptions_a_ex_i.tag_violation) begin
+      cheri_exc_cause_o   = CAUSE_TAG_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.tag_violation) begin
+      cheri_exc_cause_o   = CAUSE_TAG_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+    end else if (cheri_exceptions_if_i.tag_violation) begin
+      cheri_exc_cause_o   = CAUSE_TAG_VIOLATION;
+
+    end else if (cheri_exceptions_a_ex_i.seal_violation) begin
+      cheri_exc_cause_o   = CAUSE_SEAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.seal_violation) begin
+      cheri_exc_cause_o   = CAUSE_SEAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+    end else if (cheri_exceptions_if_i.seal_violation) begin
+      cheri_exc_cause_o   = CAUSE_SEAL_VIOLATION;
+
+    end else if (cheri_exceptions_a_ex_i.type_violation) begin
+      cheri_exc_cause_o   = CAUSE_TYPE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.type_violation) begin
+      cheri_exc_cause_o   = CAUSE_TYPE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_seal_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_SEAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_seal_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_SEAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_cinvoke_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_CINVOKE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_cinvoke_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_CINVOKE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.access_cinvoke_idc_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_ACCESS_CINVOKE_IDC_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.access_cinvoke_idc_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_ACCESS_CINVOKE_IDC_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_unseal_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_UNSEAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_unseal_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_UNSEAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_set_cid_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_SET_CID_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_set_cid_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_SET_CID_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_execute_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_EXECUTE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_execute_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_EXECUTE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+    end else if (cheri_exceptions_if_i.permit_execute_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_EXECUTE_VIOLATION;
+
+    end else if (cheri_exceptions_a_ex_i.permit_load_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_LOAD_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_load_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_LOAD_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_store_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_STORE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_store_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_STORE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_load_capability_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_LOAD_CAPABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_load_capability_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_LOAD_CAPABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_store_capability_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_STORE_CAPABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_store_capability_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_STORE_CAPABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.permit_store_local_capability_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_STORE_LOCAL_CAPABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.permit_store_local_capability_violation) begin
+      cheri_exc_cause_o   = CAUSE_PERMIT_STORE_LOCAL_CAPABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.global_violation) begin
+      cheri_exc_cause_o   = CAUSE_GLOBAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.global_violation) begin
+      cheri_exc_cause_o   = CAUSE_GLOBAL_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.length_violation) begin
+      cheri_exc_cause_o   = CAUSE_LENGTH_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.length_violation) begin
+      cheri_exc_cause_o   = CAUSE_LENGTH_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+    end else if (cheri_exceptions_if_i.length_violation) begin
+      cheri_exc_cause_o   = CAUSE_LENGTH_VIOLATION;
+
+    end else if (cheri_exceptions_a_ex_i.unaligned_base_violation) begin
+      cheri_exc_cause_o   = CAUSE_UNALIGNED_BASE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.unaligned_base_violation) begin
+      cheri_exc_cause_o   = CAUSE_UNALIGNED_BASE_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.inexact_bounds_violation) begin
+      cheri_exc_cause_o   = CAUSE_REPRESENTABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.inexact_bounds_violation) begin
+      cheri_exc_cause_o   = CAUSE_REPRESENTABILITY_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
+
+    end else if (cheri_exceptions_a_ex_i.software_defined_violation) begin
+      cheri_exc_cause_o   = CAUSE_SOFTWARE_DEFINED_PERMISSION_VIOLATION;
+      cheri_exc_reg_sel_o = REG_A;
+    end else if (cheri_exceptions_b_ex_i.software_defined_violation) begin
+      cheri_exc_cause_o   = CAUSE_SOFTWARE_DEFINED_PERMISSION_VIOLATION;
+      cheri_exc_reg_sel_o = REG_B;
     end
   end
 

@@ -1,0 +1,9 @@
+{
+  name: "cheri-cap-lib",
+  target_dir: "cheri-cap-lib",
+
+  upstream: {
+    url: "https://github.com/CTSRD-CHERI/cheri-cap-lib",
+    rev: "149733072a79b0fa016603119f5a3f32ab94f8f9",
+  }
+}

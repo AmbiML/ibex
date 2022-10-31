@@ -15,6 +15,7 @@ module ibex_register_file_ff #(
   parameter int unsigned          DataWidth         = 32,
   parameter bit                   DummyInstructions = 0,
   parameter bit                   WrenCheck         = 0,
+  parameter logic [DataWidth-1:0] WordResetVal      = '0,
   parameter logic [DataWidth-1:0] WordZeroVal       = '0
 ) (
   // Clock and Reset
@@ -90,7 +91,7 @@ module ibex_register_file_ff #(
   for (genvar i = 1; i < NUM_WORDS; i++) begin : g_rf_flops
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
-        rf_reg_q[i] <= WordZeroVal;
+        rf_reg_q[i] <= WordResetVal;
       end else if (we_a_dec[i]) begin
         rf_reg_q[i] <= wdata_a_i;
       end

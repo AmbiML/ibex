@@ -16,6 +16,7 @@ module ibex_register_file_fpga #(
     parameter int unsigned          DataWidth         = 32,
     parameter bit                   DummyInstructions = 0,
     parameter bit                   WrenCheck         = 0,
+    parameter logic [DataWidth-1:0] WordResetVal      = '0,
     parameter logic [DataWidth-1:0] WordZeroVal       = '0
 ) (
   // Clock and Reset
@@ -47,10 +48,10 @@ module ibex_register_file_fpga #(
   logic we; // write enable if writing to any register other than R0
 
   // async_read a
-  assign rdata_a_o = (raddr_a_i == '0) ? '0 : mem[raddr_a_i];
+  assign rdata_a_o = (raddr_a_i == '0) ? WordZeroVal : mem[raddr_a_i];
 
   // async_read b
-  assign rdata_b_o = (raddr_b_i == '0) ? '0 : mem[raddr_b_i];
+  assign rdata_b_o = (raddr_b_i == '0) ? WordZeroVal : mem[raddr_b_i];
 
   // we select
   assign we = (waddr_a_i == '0) ? 1'b0 : we_a_i;
@@ -78,7 +79,7 @@ module ibex_register_file_fpga #(
   // Make sure we initialize the BRAM with the correct register reset value.
   initial begin
     for (int k = 0; k < NUM_WORDS; k++) begin
-      mem[k] = WordZeroVal;
+      mem[k] = WordResetVal;
     end
   end
 

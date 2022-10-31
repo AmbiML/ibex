@@ -15,8 +15,10 @@
 `include "dv_fcov_macros.svh"
 
 module ibex_load_store_unit #(
-  parameter bit          MemECC       = 1'b0,
-  parameter int unsigned MemDataWidth = MemECC ? 32 + 7 : 32
+  parameter bit          MemECC        = 1'b0,
+  parameter int unsigned MemDataWidth  = MemECC ? 32 + 7 : 32,
+  parameter int unsigned CheriCapWidth = 91,
+  parameter bit [CheriCapWidth-1:0] CheriNullCap = 91'h0
 ) (
   input  logic         clk_i,
   input  logic         rst_ni,
@@ -27,24 +29,35 @@ module ibex_load_store_unit #(
   input  logic         data_rvalid_i,
   input  logic         data_bus_err_i,
   input  logic         data_pmp_err_i,
+  input  ibex_pkg::cheri_exc_t cheri_err_info_i,
 
   output logic [31:0]             data_addr_o,
   output logic                    data_we_o,
   output logic [3:0]              data_be_o,
   output logic [MemDataWidth-1:0] data_wdata_o,
+  output logic                    data_first_access_o, // this is the first part of an access
+                                                       // (ie not the second part of a
+                                                       // misaligned/cap access)
+                                                       // only used for CHERI checks
   input  logic [MemDataWidth-1:0] data_rdata_i,
 
   // signals to/from ID/EX stage
-  input  logic         lsu_we_i,             // write enable                     -> from ID/EX
-  input  logic [1:0]   lsu_type_i,           // data type: word, half word, byte -> from ID/EX
-  input  logic [31:0]  lsu_wdata_i,          // data to write to memory          -> from ID/EX
-  input  logic         lsu_sign_ext_i,       // sign extension                   -> from ID/EX
+  input  logic                      lsu_we_i,        // write enable                     -> from ID/EX
+  input  logic [1:0]                lsu_type_i,      // data type: word, half word, byte -> from ID/EX
+  input  logic [CheriCapWidth-1:0]  lsu_wdata_cap_i, // integer to write to memory       -> from ID/EX
+  input  logic [31:0]               lsu_wdata_int_i, // capability to write to memory    -> from ID/EX
+  input  logic                      lsu_wcap_i,      // write capability or integer?     -> from ID/EX
+  input  logic                      lsu_sign_ext_i,  // sign extension                   -> from ID/EX
 
-  output logic [31:0]  lsu_rdata_o,          // requested data                   -> to ID/EX
-  output logic         lsu_rdata_valid_o,
-  input  logic         lsu_req_i,            // data request                     -> from ID/EX
+  output logic [CheriCapWidth-1:0]  lsu_rdata_cap_o,   // requested data                   -> to ID/EX
+  output logic [31:0]               lsu_rdata_int_o,   // requested data                   -> to ID/EX
+  output logic                      lsu_rcap_o,        // capability or integer read?      -> to ID/EX
+  output logic                      lsu_rdata_valid_o,
+  input  logic                      lsu_req_i,         // data request                     -> from ID/EX
 
   input  logic [31:0]  adder_result_ex_i,    // address computed in ALU          -> from ID/EX
+  input  logic [31:0]  auth_addr_i,          // the address of the authorizing capability
+  input  logic         add_auth_addr_i,      // whether to add the address of the authorizing capability
 
   output logic         addr_incr_req_o,      // request address increment for
                                               // misaligned accesses              -> to ID/EX
@@ -62,14 +75,19 @@ module ibex_load_store_unit #(
   output logic         load_err_o,
   output logic         store_err_o,
   output logic         load_intg_err_o,
+  output logic         load_misalign_err_o,
+  output logic         store_misalign_err_o,
+  output logic         cheri_err_o,
+  output ibex_pkg::cheri_exc_t cheri_err_info_o,
 
   output logic         busy_o,
 
   output logic         perf_load_o,
   output logic         perf_store_o
 );
+  import ibex_pkg::*;
 
-  logic [31:0]  data_addr;
+  logic [31:0]  data_addr, data_addr_int;
   logic [31:0]  data_addr_w_aligned;
   logic [31:0]  addr_last_q, addr_last_d;
 
@@ -81,11 +99,13 @@ module ibex_load_store_unit #(
   logic [1:0]   data_type_q;
   logic         data_sign_ext_q;
   logic         data_we_q;
+  logic         lsu_wcap_q;
+  logic         lsu_wupper_q, lsu_wupper_d;
 
   logic [1:0]   data_offset;   // mux control for data to be written to memory
 
   logic [3:0]   data_be;
-  logic [31:0]  data_wdata;
+  logic [32:0]  data_wdata;
 
   logic [31:0]  data_rdata_ext;
 
@@ -98,17 +118,28 @@ module ibex_load_store_unit #(
                                                           // part of a misaligned access
   logic         pmp_err_q, pmp_err_d;
   logic         lsu_err_q, lsu_err_d;
+  logic         lsu_misalign_err_q, lsu_misalign_err_d;
   logic         data_intg_err, data_or_pmp_err;
+  cheri_exc_t   cheri_err_info_q, cheri_err_info_d;
+  logic         cheri_err_any_q, cheri_err_any_d;
+  // bitwise or of the CHERI error input
+  logic         cheri_err_or;
+  assign        cheri_err_or = |cheri_err_info_i;
+
+  logic [64:0]  wdata_mem_cap;
+  logic [32:0]  rdata_mem_cap_lower_q;
 
   typedef enum logic [2:0]  {
     IDLE, WAIT_GNT_MIS, WAIT_RVALID_MIS, WAIT_GNT,
-    WAIT_RVALID_MIS_GNTS_DONE
+    WAIT_RVALID_MIS_GNTS_DONE,
+    WAIT_GNT_CAP, WAIT_RVALID_CAP, WAIT_RVALID_CAP_GNTS_DONE // similar to misaligned
   } ls_fsm_e;
 
   ls_fsm_e ls_fsm_cs, ls_fsm_ns;
 
-  assign data_addr   = adder_result_ex_i;
-  assign data_offset = data_addr[1:0];
+  assign data_addr_int = add_auth_addr_i ? adder_result_ex_i + auth_addr_i : adder_result_ex_i;
+  assign data_addr     = data_addr_int;
+  assign data_offset   = data_addr[1:0];
 
   ///////////////////
   // BE generation //
@@ -150,8 +181,7 @@ module ibex_load_store_unit #(
         end
       end
 
-      2'b10,
-      2'b11: begin // Writing a byte
+      2'b10: begin // Writing a byte
         unique case (data_offset)
           2'b00:   data_be = 4'b0001;
           2'b01:   data_be = 4'b0010;
@@ -161,7 +191,11 @@ module ibex_load_store_unit #(
         endcase // case (data_offset)
       end
 
-      default:     data_be = 4'b1111;
+      2'b11: begin
+        // writing a capability. Spec only allows for aligned capability accesses, so this must be aligned
+        // and hence is a full word access
+        data_be = 4'b1111;
+      end
     endcase // case (lsu_type_i)
   end
 
@@ -172,13 +206,18 @@ module ibex_load_store_unit #(
   // prepare data to be written to the memory
   // we handle misaligned accesses, half word and byte accesses here
   always_comb begin
-    unique case (data_offset)
-      2'b00:   data_wdata =  lsu_wdata_i[31:0];
-      2'b01:   data_wdata = {lsu_wdata_i[23:0], lsu_wdata_i[31:24]};
-      2'b10:   data_wdata = {lsu_wdata_i[15:0], lsu_wdata_i[31:16]};
-      2'b11:   data_wdata = {lsu_wdata_i[ 7:0], lsu_wdata_i[31: 8]};
-      default: data_wdata =  lsu_wdata_i[31:0];
-    endcase // case (data_offset)
+    if (lsu_wcap_i) begin
+      data_wdata = {wdata_mem_cap[64], lsu_wupper_q ? wdata_mem_cap[63:32] : wdata_mem_cap[31:0]};
+    end else begin
+      unique case (data_offset)
+        2'b00:   data_wdata[31:0] =  lsu_wdata_int_i[31:0];
+        2'b01:   data_wdata[31:0] = {lsu_wdata_int_i[23:0], lsu_wdata_int_i[31:24]};
+        2'b10:   data_wdata[31:0] = {lsu_wdata_int_i[15:0], lsu_wdata_int_i[31:16]};
+        2'b11:   data_wdata[31:0] = {lsu_wdata_int_i[ 7:0], lsu_wdata_int_i[31: 8]};
+        default: data_wdata[31:0] =  lsu_wdata_int_i[31:0];
+      endcase // case (data_offset)
+      data_wdata[32] = 1'b0;
+    end
   end
 
   /////////////////////
@@ -188,9 +227,11 @@ module ibex_load_store_unit #(
   // register for unaligned rdata
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      rdata_q <= '0;
+      rdata_q               <= '0;
+      rdata_mem_cap_lower_q <= '0;
     end else if (rdata_update) begin
-      rdata_q <= data_rdata_i[31:8];
+      rdata_q               <= data_rdata_i[31:8];
+      rdata_mem_cap_lower_q <= data_rdata_i;
     end
   end
 
@@ -201,11 +242,13 @@ module ibex_load_store_unit #(
       data_type_q     <= 2'h0;
       data_sign_ext_q <= 1'b0;
       data_we_q       <= 1'b0;
+      lsu_wcap_q      <= 1'b0;
     end else if (ctrl_update) begin
       rdata_offset_q  <= data_offset;
       data_type_q     <= lsu_type_i;
       data_sign_ext_q <= lsu_sign_ext_i;
       data_we_q       <= lsu_we_i;
+      lsu_wcap_q      <= lsu_wcap_i;
     end
   end
 
@@ -213,7 +256,7 @@ module ibex_load_store_unit #(
   // errors, mtval needs the (first) failing address.  Where an aligned access or the first half of
   // a misaligned access sees an error provide the calculated access address. For the second half of
   // a misaligned access provide the word aligned address of the second half.
-  assign addr_last_d = addr_incr_req_o ? data_addr_w_aligned : data_addr;
+  assign addr_last_d = addr_incr_req_o ? {adder_result_ex_i[31:2], 2'b0} : adder_result_ex_i;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -321,8 +364,8 @@ module ibex_load_store_unit #(
     unique case (data_type_q)
       2'b00:       data_rdata_ext = rdata_w_ext;
       2'b01:       data_rdata_ext = rdata_h_ext;
-      2'b10,2'b11: data_rdata_ext = rdata_b_ext;
-      default:     data_rdata_ext = rdata_w_ext;
+      2'b10:       data_rdata_ext = rdata_b_ext;
+      2'b11:       data_rdata_ext = rdata_w_ext; // capability writes use the full word
     endcase // case (data_type_q)
   end
 
@@ -371,32 +414,60 @@ module ibex_load_store_unit #(
     handle_misaligned_d = handle_misaligned_q;
     pmp_err_d           = pmp_err_q;
     lsu_err_d           = lsu_err_q;
+    // don't preserve the old value; the signal should only be high for 1 cycle
+    lsu_misalign_err_d  = 1'b0;
+    data_first_access_o = 1'b0;
 
     addr_update         = 1'b0;
     ctrl_update         = 1'b0;
     rdata_update        = 1'b0;
+    lsu_wupper_d        = lsu_wupper_q;
 
     perf_load_o         = 1'b0;
     perf_store_o        = 1'b0;
+
+    cheri_err_info_d    = cheri_err_info_q;
+    cheri_err_any_d     = 1'b0;
 
     unique case (ls_fsm_cs)
 
       IDLE: begin
         pmp_err_d = 1'b0;
         if (lsu_req_i) begin
-          data_req_o   = 1'b1;
-          pmp_err_d    = data_pmp_err_i;
-          lsu_err_d    = 1'b0;
-          perf_load_o  = ~lsu_we_i;
-          perf_store_o = lsu_we_i;
-
-          if (data_gnt_i) begin
-            ctrl_update         = 1'b1;
-            addr_update         = 1'b1;
-            handle_misaligned_d = split_misaligned_access;
-            ls_fsm_ns           = split_misaligned_access ? WAIT_RVALID_MIS : IDLE;
+          if (cheri_err_or) begin
+            // if this access will cause a CHERI error, cause an exception and
+            // do not make an access
+            lsu_err_d        = 1'b1;
+            cheri_err_info_d = cheri_err_info_i;
+            cheri_err_any_d  = 1'b1;
+            ctrl_update      = 1'b1;
+          end else if (lsu_wcap_i & |data_addr[2:0]) begin
+            // if this is an unaligned capability access, cause an exception and
+            // do not make an access
+            lsu_err_d          = 1'b1;
+            lsu_misalign_err_d = 1'b1;
+            ctrl_update        = 1'b1;
           end else begin
-            ls_fsm_ns           = split_misaligned_access ? WAIT_GNT_MIS    : WAIT_GNT;
+            data_req_o   = 1'b1;
+            pmp_err_d    = data_pmp_err_i;
+            lsu_err_d    = 1'b0;
+            perf_load_o  = ~lsu_we_i;
+            perf_store_o = lsu_we_i;
+            data_first_access_o = 1'b1;
+
+            if (data_gnt_i) begin
+              ctrl_update         = 1'b1;
+              addr_update         = 1'b1;
+              lsu_wupper_d        = lsu_wcap_i;
+              handle_misaligned_d = split_misaligned_access;
+              ls_fsm_ns           = lsu_wcap_i ? WAIT_RVALID_CAP
+                                  : split_misaligned_access ? WAIT_RVALID_MIS
+                                  : IDLE;
+            end else begin
+              ls_fsm_ns           = lsu_wcap_i ? WAIT_GNT_CAP
+                                  : split_misaligned_access ? WAIT_GNT_MIS
+                                  : WAIT_GNT;
+            end
           end
         end
       end
@@ -447,7 +518,7 @@ module ibex_load_store_unit #(
 
       WAIT_GNT: begin
         // tell ID/EX stage to update the address
-        addr_incr_req_o = handle_misaligned_q;
+        addr_incr_req_o = handle_misaligned_q | lsu_wcap_q;
         data_req_o      = 1'b1;
         if (data_gnt_i || pmp_err_q) begin
           ctrl_update         = 1'b1;
@@ -455,6 +526,7 @@ module ibex_load_store_unit #(
           addr_update         = ~lsu_err_q;
           ls_fsm_ns           = IDLE;
           handle_misaligned_d = 1'b0;
+          lsu_wupper_d        = 1'b0;
         end
       end
 
@@ -477,6 +549,71 @@ module ibex_load_store_unit #(
         end
       end
 
+      WAIT_GNT_CAP: begin
+        data_req_o = 1'b1;
+        // data_pmp_err_i is valid during the address phase of a request. An error will block the
+        // external request and so a data_gnt_i might never be signalled. The registered version
+        // pmp_err_q is only updated for new address phases and so can be used in WAIT_GNT* and
+        // WAIT_RVALID* states
+        if (data_gnt_i || pmp_err_q) begin
+          addr_update         = 1'b1;
+          ctrl_update         = 1'b1;
+          handle_misaligned_d = 1'b1;
+          lsu_wupper_d        = 1'b1;
+          ls_fsm_ns           = WAIT_RVALID_CAP;
+        end
+      end
+
+      WAIT_RVALID_CAP: begin
+        // push out second request
+        data_req_o = 1'b1;
+        // tell ID/EX stage to update the address
+        addr_incr_req_o = 1'b1;
+
+        // first part rvalid is received, or gets a PMP error
+        if (data_rvalid_i || pmp_err_q) begin
+          // Update the PMP error for the second part
+          pmp_err_d = data_pmp_err_i;
+          // Record the error status of the first part
+          lsu_err_d = data_bus_err_i | pmp_err_q;
+          // Capture the first rdata for loads
+          rdata_update = ~data_we_q;
+          // If already granted, wait for second rvalid
+          ls_fsm_ns = data_gnt_i ? IDLE : WAIT_GNT;
+          // Update the address for the second part, if no error
+          addr_update = data_gnt_i & ~(data_bus_err_i | pmp_err_q);
+          // clear handle_misaligned if second request is granted
+          handle_misaligned_d = ~data_gnt_i;
+          lsu_wupper_d = ~data_gnt_i;
+        end else begin
+          // first part rvalid is NOT received
+          if (data_gnt_i) begin
+            // second grant is received
+            ls_fsm_ns = WAIT_RVALID_CAP_GNTS_DONE;
+            handle_misaligned_d = 1'b0;
+            lsu_wupper_d = 1'b0;
+          end
+        end
+      end
+
+      WAIT_RVALID_CAP_GNTS_DONE: begin
+        // tell ID/EX stage to update the address (to make sure the
+        // second address can be captured correctly for mtval and PMP checking)
+        addr_incr_req_o = 1'b1;
+        // Wait for the first rvalid, second request is already granted
+        if (data_rvalid_i) begin
+          // Update the pmp error for the second part
+          pmp_err_d = data_pmp_err_i;
+          // The first part cannot see a PMP error in this state
+          lsu_err_d = data_bus_err_i;
+          // Now we can update the address for the second part if no error
+          addr_update = ~data_bus_err_i;
+          // Capture the first rdata for loads
+          rdata_update = ~data_we_q;
+          // Wait for second rvalid
+          ls_fsm_ns = IDLE;
+        end
+      end
       default: begin
         ls_fsm_ns = IDLE;
       end
@@ -490,13 +627,21 @@ module ibex_load_store_unit #(
     if (!rst_ni) begin
       ls_fsm_cs           <= IDLE;
       handle_misaligned_q <= '0;
+      lsu_wupper_q        <= '0;
       pmp_err_q           <= '0;
       lsu_err_q           <= '0;
+      lsu_misalign_err_q  <= '0;
+      cheri_err_any_q     <= '0;
+      cheri_err_info_q    <= cheri_exc_t'(0);
     end else begin
       ls_fsm_cs           <= ls_fsm_ns;
       handle_misaligned_q <= handle_misaligned_d;
+      lsu_wupper_q        <= lsu_wupper_d;
       pmp_err_q           <= pmp_err_d;
       lsu_err_q           <= lsu_err_d;
+      lsu_misalign_err_q  <= lsu_misalign_err_d;
+      cheri_err_any_q     <= cheri_err_any_d;
+      cheri_err_info_q    <= cheri_err_info_d;
     end
   end
 
@@ -505,12 +650,13 @@ module ibex_load_store_unit #(
   /////////////
 
   assign data_or_pmp_err    = lsu_err_q | data_bus_err_i | pmp_err_q;
-  assign lsu_resp_valid_o   = (data_rvalid_i | pmp_err_q) & (ls_fsm_cs == IDLE);
+  assign lsu_resp_valid_o   = (data_rvalid_i | pmp_err_q | cheri_err_any_q) & (ls_fsm_cs == IDLE);
   assign lsu_rdata_valid_o  =
     (ls_fsm_cs == IDLE) & data_rvalid_i & ~data_or_pmp_err & ~data_we_q & ~data_intg_err;
 
   // output to register file
-  assign lsu_rdata_o = data_rdata_ext;
+  assign lsu_rdata_int_o = data_rdata_ext;
+  assign lsu_rcap_o      = lsu_wcap_q;
 
   // output data address must be word aligned
   assign data_addr_w_aligned = {data_addr[31:2], 2'b00};
@@ -538,8 +684,12 @@ module ibex_load_store_unit #(
   assign addr_last_o   = addr_last_q;
 
   // Signal a load or store error depending on the transaction type outstanding
-  assign load_err_o      = data_or_pmp_err & ~data_we_q & lsu_resp_valid_o;
-  assign store_err_o     = data_or_pmp_err &  data_we_q & lsu_resp_valid_o;
+  assign load_err_o       = data_or_pmp_err & ~data_we_q & lsu_resp_valid_o;
+  assign store_err_o      = data_or_pmp_err &  data_we_q & lsu_resp_valid_o;
+  assign cheri_err_o      = cheri_err_any_q & lsu_resp_valid_o;
+  assign load_misalign_err_o  = lsu_misalign_err_q & ~data_we_q;
+  assign store_misalign_err_o = lsu_misalign_err_q &  data_we_q;
+  assign cheri_err_info_o     = cheri_err_info_q;
   // Integrity errors are their own category for timing reasons. load_err_o is factored directly
   // into data_req_o to enable synchronous exception on load errors without performance loss (An
   // upcoming load cannot request until the current load has seen its response, so the earliest
@@ -551,6 +701,17 @@ module ibex_load_store_unit #(
   assign load_intg_err_o = data_intg_err & data_rvalid_i;
 
   assign busy_o = (ls_fsm_cs != IDLE);
+
+  // CHERI module instantiations
+  module_wrap64_toMem lsu_toMem(
+      .wrap64_toMem_cap(lsu_wdata_cap_i),
+      .wrap64_toMem    (wdata_mem_cap));
+
+  module_wrap64_fromMem lsu_fromMem(
+      .wrap64_fromMem_mem_cap({rdata_mem_cap_lower_q[32] & data_rdata_i[32], // both tags must be set
+                               data_rdata_i[31:0],
+                               rdata_mem_cap_lower_q[31:0]}),
+      .wrap64_fromMem        (lsu_rdata_cap_o));
 
   //////////
   // FCOV //

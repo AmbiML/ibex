@@ -16,6 +16,7 @@ module ibex_register_file_latch #(
   parameter int unsigned          DataWidth         = 32,
   parameter bit                   DummyInstructions = 0,
   parameter bit                   WrenCheck         = 0,
+  parameter logic [DataWidth-1:0] WordResetVal      = '0,
   parameter logic [DataWidth-1:0] WordZeroVal       = '0
 ) (
   // Clock and Reset
@@ -82,7 +83,7 @@ module ibex_register_file_latch #(
   // Use clk_int here, since otherwise we don't want to write anything anyway.
   always_ff @(posedge clk_int or negedge rst_ni) begin : sample_wdata
     if (!rst_ni) begin
-      wdata_a_q   <= WordZeroVal;
+      wdata_a_q   <= WordResetVal;
     end else begin
       if (we_a_i) begin
         wdata_a_q <= wdata_a_i;

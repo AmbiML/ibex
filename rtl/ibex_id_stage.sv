@@ -25,7 +25,8 @@ module ibex_id_stage #(
   parameter bit               BranchTargetALU = 0,
   parameter bit               WritebackStage  = 0,
   parameter bit               BranchPredictor = 0,
-  parameter bit               MemECC          = 1'b0
+  parameter bit               MemECC          = 1'b0,
+  parameter int unsigned      CheriCapWidth   = 91
 ) (
   input  logic                      clk_i,
   input  logic                      rst_ni,
@@ -60,8 +61,10 @@ module ibex_id_stage #(
   input  logic                      illegal_c_insn_i,
   input  logic                      instr_fetch_err_i,
   input  logic                      instr_fetch_err_plus2_i,
+  input  logic                      instr_cheri_err_i,
 
   input  logic [31:0]               pc_id_i,
+  input  logic [CheriCapWidth-1:0]  pcc_id_i,
 
   // Stalls
   input  logic                      ex_valid_i,       // EX stage has valid output
@@ -91,6 +94,32 @@ module ibex_id_stage #(
   output logic [31:0]               multdiv_operand_b_ex_o,
   output logic                      multdiv_ready_id_o,
 
+  // CHERI operation selection
+  output logic                            cheri_en_o,
+  output ibex_pkg::cheri_base_opcode_e    cheri_base_opcode_o,
+  output ibex_pkg::cheri_threeop_funct7_e cheri_threeop_opcode_o,
+  output ibex_pkg::cheri_s_a_d_funct5_e   cheri_s_a_d_opcode_o,
+  output logic                            cheri_alu_exc_only_o,
+
+  // CHERI operands
+  output logic [CheriCapWidth-1:0]  cheri_operand_a_o,
+  output logic [CheriCapWidth-1:0]  cheri_operand_b_o,
+
+  // CHERI results
+  input  [CheriCapWidth-1:0]        cheri_result_ex_i,
+  input  logic [CheriCapWidth-1:0]  scr_rdata_i,
+  input  logic                      cheri_wrote_cap_i,
+
+  // CHERI exceptions
+  input  ibex_pkg::cheri_exc_t   cheri_exceptions_a_ex_i,
+  input  ibex_pkg::cheri_exc_t   cheri_exceptions_b_ex_i,
+  input  ibex_pkg::cheri_exc_t   cheri_exceptions_lsu_i,
+  input  ibex_pkg::cheri_exc_t   cheri_exceptions_if_i,
+
+  // CHERI exception cause
+  output ibex_pkg::c_exc_cause_e       cheri_exc_cause_o,
+  output ibex_pkg::c_exc_reg_mux_sel_e cheri_exc_reg_sel_o,
+
   // CSR
   output logic                      csr_access_o,
   output ibex_pkg::csr_op_e         csr_op_o,
@@ -106,13 +135,29 @@ module ibex_id_stage #(
   input  logic                      csr_mstatus_tw_i,
   input  logic                      illegal_csr_insn_i,
   input  logic                      data_ind_timing_i,
+  input  logic                      csr_no_asr_i,
+
+  // SCR
+  output logic                      scr_access_o,
+  output ibex_pkg::scr_op_e         scr_op_o,
+  output logic                      scr_op_en_o,
+  input  logic                      illegal_scr_insn_i,
+  input  logic                      scr_no_asr_i,
+
+  // SCR values
+  input logic [CheriCapWidth-1:0]   scr_ddc_i,
 
   // Interface to load store unit
   output logic                      lsu_req_o,
   output logic                      lsu_we_o,
   output logic [1:0]                lsu_type_o,
   output logic                      lsu_sign_ext_o,
-  output logic [31:0]               lsu_wdata_o,
+  output logic [CheriCapWidth-1:0]  lsu_wdata_cap_o,
+  output logic [31:0]               lsu_wdata_int_o,
+  output logic                      lsu_wcap_o,
+  output logic [CheriCapWidth-1:0]  lsu_mem_auth_cap_o, // Authorizing capability for memory accesses
+  output logic [31:0]               lsu_auth_addr_o,
+  output logic                      lsu_add_auth_addr_o,
 
   input  logic                      lsu_req_done_i, // Data req to LSU is complete and
                                                     // instruction can move to writeback
@@ -132,6 +177,9 @@ module ibex_id_stage #(
   input  logic                      lsu_load_err_i,
   input  logic                      lsu_store_err_i,
   input  logic                      lsu_load_intg_err_i,
+  input  logic                      lsu_load_misalign_err_i,
+  input  logic                      lsu_store_misalign_err_i,
+  input  logic                      lsu_cheri_err_i,
 
   // Debug Signal
   output logic                      debug_mode_o,
@@ -149,22 +197,28 @@ module ibex_id_stage #(
 
   // Register file read
   output logic [4:0]                rf_raddr_a_o,
-  input  logic [31:0]               rf_rdata_a_i,
+  input  logic [CheriCapWidth-1:0]  rf_rdata_a_cap_i,
+  input  logic [31:0]               rf_rdata_a_int_i,
   output logic [4:0]                rf_raddr_b_o,
-  input  logic [31:0]               rf_rdata_b_i,
+  input  logic [CheriCapWidth-1:0]  rf_rdata_b_cap_i,
+  input  logic [31:0]               rf_rdata_b_int_i,
   output logic                      rf_ren_a_o,
   output logic                      rf_ren_b_o,
 
   // Register file write (via writeback)
   output logic [4:0]                rf_waddr_id_o,
-  output logic [31:0]               rf_wdata_id_o,
+  output logic [CheriCapWidth-1:0]  rf_wdata_cap_id_o,
+  output logic [31:0]               rf_wdata_int_id_o,
   output logic                      rf_we_id_o,
+  output logic                      rf_wcap_id_o,       // whether the write from ID is a capability write
   output logic                      rf_rd_a_wb_match_o,
   output logic                      rf_rd_b_wb_match_o,
 
   // Register write information from writeback (for resolving data hazards)
   input  logic [4:0]                rf_waddr_wb_i,
-  input  logic [31:0]               rf_wdata_fwd_wb_i,
+  input  logic [CheriCapWidth-1:0]  rf_wdata_cap_fwd_wb_i,
+  input  logic [31:0]               rf_wdata_int_fwd_wb_i,
+  input  logic                      rf_wcap_fwd_wb_i,
   input  logic                      rf_write_wb_i,
 
   output  logic                     en_wb_o,
@@ -175,6 +229,7 @@ module ibex_id_stage #(
   input logic                       outstanding_store_wb_i,
 
   // Performance Counters
+  output logic                      perf_xret_o,    // executing an xRET instr
   output logic                      perf_jump_o,    // executing a jump instr
   output logic                      perf_branch_o,  // executing a branch instr
   output logic                      perf_tbranch_o, // executing a taken branch instr
@@ -191,6 +246,7 @@ module ibex_id_stage #(
   logic        illegal_insn_dec;
   logic        illegal_dret_insn;
   logic        illegal_umode_insn;
+  logic        mret_no_asr;
   logic        ebrk_insn;
   logic        mret_insn_dec;
   logic        dret_insn_dec;
@@ -249,8 +305,10 @@ module ibex_id_stage #(
   assign rf_ren_a_o = rf_ren_a;
   assign rf_ren_b_o = rf_ren_b;
 
-  logic [31:0] rf_rdata_a_fwd;
-  logic [31:0] rf_rdata_b_fwd;
+  logic [CheriCapWidth-1:0] rf_rdata_a_cap_fwd;
+  logic [31:0]              rf_rdata_a_int_fwd;
+  logic [CheriCapWidth-1:0] rf_rdata_b_cap_fwd;
+  logic [31:0]              rf_rdata_b_int_fwd;
 
   // ALU Control
   alu_op_e     alu_operator;
@@ -267,6 +325,13 @@ module ibex_id_stage #(
   imm_a_sel_e  imm_a_mux_sel;
   imm_b_sel_e  imm_b_mux_sel, imm_b_mux_sel_dec;
 
+  c_op_a_sel_e  cheri_op_a_mux_sel;
+  c_op_b_sel_e  cheri_op_b_mux_sel;
+  c_imm_b_sel_e cheri_imm_b_mux_sel;
+  logic [31:0] cheri_imm_b;
+
+  logic mem_ddc_relative;
+
   // Multiplier Control
   logic        mult_en_id, mult_en_dec; // use integer multiplier
   logic        div_en_id, div_en_dec;   // use integer division or reminder
@@ -279,6 +344,7 @@ module ibex_id_stage #(
   logic [1:0]  lsu_type;
   logic        lsu_sign_ext;
   logic        lsu_req, lsu_req_dec;
+  logic        lsu_wcap;
   logic        data_req_allowed;
 
   // CSR control
@@ -286,6 +352,12 @@ module ibex_id_stage #(
 
   logic [31:0] alu_operand_a;
   logic [31:0] alu_operand_b;
+
+  // CHERI module inputs/outputs
+  logic [CheriPermsWidth-1:0] pcc_getPerms_o;
+  logic                       pcc_has_asr;
+  logic                       pcc_getFlags_o;
+  logic [31:0]                auth_getAddr_o;
 
   /////////////
   // LSU Mux //
@@ -295,6 +367,10 @@ module ibex_id_stage #(
   assign alu_op_a_mux_sel = lsu_addr_incr_req_i ? OP_A_FWD        : alu_op_a_mux_sel_dec;
   assign alu_op_b_mux_sel = lsu_addr_incr_req_i ? OP_B_IMM        : alu_op_b_mux_sel_dec;
   assign imm_b_mux_sel    = lsu_addr_incr_req_i ? IMM_B_INCR_ADDR : imm_b_mux_sel_dec;
+
+  // Mux capability that provides capability for memory accesses
+  assign lsu_mem_auth_cap_o = mem_ddc_relative ? scr_ddc_i : rf_rdata_a_cap_fwd;
+  assign lsu_auth_addr_o    = auth_getAddr_o;
 
   ///////////////////
   // Operand MUXES //
@@ -306,7 +382,7 @@ module ibex_id_stage #(
   // Main ALU MUX for Operand A
   always_comb begin : alu_operand_a_mux
     unique case (alu_op_a_mux_sel)
-      OP_A_REG_A:  alu_operand_a = rf_rdata_a_fwd;
+      OP_A_REG_A:  alu_operand_a = rf_rdata_a_int_fwd;
       OP_A_FWD:    alu_operand_a = lsu_addr_last_i;
       OP_A_CURRPC: alu_operand_a = pc_id_i;
       OP_A_IMM:    alu_operand_a = imm_a;
@@ -318,7 +394,7 @@ module ibex_id_stage #(
     // Branch target ALU operand A mux
     always_comb begin : bt_operand_a_mux
       unique case (bt_a_mux_sel)
-        OP_A_REG_A:  bt_a_operand_o = rf_rdata_a_fwd;
+        OP_A_REG_A:  bt_a_operand_o = rf_rdata_a_int_fwd;
         OP_A_CURRPC: bt_a_operand_o = pc_id_i;
         default:     bt_a_operand_o = pc_id_i;
       endcase
@@ -343,6 +419,7 @@ module ibex_id_stage #(
         IMM_B_U:         imm_b = imm_u_type;
         IMM_B_INCR_PC:   imm_b = instr_is_compressed_i ? 32'h2 : 32'h4;
         IMM_B_INCR_ADDR: imm_b = 32'h4;
+        IMM_B_ZERO:      imm_b = 0;
         default:         imm_b = 32'h4;
       endcase
     end
@@ -351,7 +428,8 @@ module ibex_id_stage #(
         IMM_B_S,
         IMM_B_U,
         IMM_B_INCR_PC,
-        IMM_B_INCR_ADDR})
+        IMM_B_INCR_ADDR,
+        IMM_B_ZERO})
   end else begin : g_nobtalu
     op_a_sel_e  unused_a_mux_sel;
     imm_b_sel_e unused_b_mux_sel;
@@ -371,6 +449,7 @@ module ibex_id_stage #(
         IMM_B_J:         imm_b = imm_j_type;
         IMM_B_INCR_PC:   imm_b = instr_is_compressed_i ? 32'h2 : 32'h4;
         IMM_B_INCR_ADDR: imm_b = 32'h4;
+        IMM_B_ZERO:      imm_b = 0;
         default:         imm_b = 32'h4;
       endcase
     end
@@ -381,11 +460,52 @@ module ibex_id_stage #(
         IMM_B_U,
         IMM_B_J,
         IMM_B_INCR_PC,
-        IMM_B_INCR_ADDR})
+        IMM_B_INCR_ADDR,
+        IMM_B_ZERO})
   end
 
   // ALU MUX for Operand B
-  assign alu_operand_b = (alu_op_b_mux_sel == OP_B_IMM) ? imm_b : rf_rdata_b_fwd;
+  assign alu_operand_b = (alu_op_b_mux_sel == OP_B_IMM) ? imm_b : rf_rdata_b_int_fwd;
+
+  // CHERI operand A muxing
+  always_comb begin
+    unique case (cheri_op_a_mux_sel)
+      CHERI_OP_A_REG_CAP: cheri_operand_a_o = rf_rdata_a_cap_fwd;
+      CHERI_OP_A_REG_DDC: cheri_operand_a_o = rf_raddr_a_o == '0 ? scr_ddc_i : rf_rdata_a_cap_fwd;
+      // TODO need to use PCC here
+      CHERI_OP_A_PCC:     cheri_operand_a_o = pcc_id_i;
+      default:            cheri_operand_a_o = 'X;
+    endcase
+  end
+
+  // CHERI immediate mux for operand B
+  always_comb begin
+    cheri_imm_b = '0;
+    unique case (cheri_imm_b_mux_sel)
+      CHERI_IMM_B_INCR_PC: cheri_imm_b = 'h4;
+      CHERI_IMM_B_I:       cheri_imm_b = imm_i_type;
+      CHERI_IMM_B_S:       cheri_imm_b = imm_s_type;
+      CHERI_IMM_B_U:       cheri_imm_b = imm_u_type;
+      CHERI_IMM_B_RS2:     cheri_imm_b = {{27{1'b0}}, rf_raddr_b_o};
+      CHERI_IMM_B_ZERO:    cheri_imm_b = '0;
+      CHERI_IMM_B_TWO:     cheri_imm_b = 'h2;
+      CHERI_IMM_B_J:       cheri_imm_b = imm_j_type;
+      default:             cheri_imm_b = 'X;
+    endcase
+  end
+
+  // CHERI operand B muxing
+  always_comb begin
+    unique case (cheri_op_b_mux_sel)
+      CHERI_OP_B_IMM:     cheri_operand_b_o = {{(CheriCapWidth-32){1'b0}}, cheri_imm_b};
+      CHERI_OP_B_REG_CAP: cheri_operand_b_o = rf_rdata_b_cap_fwd;
+      CHERI_OP_B_REG_DDC: cheri_operand_b_o = rf_raddr_b_o == '0 ? scr_ddc_i : rf_rdata_b_cap_fwd;
+      // TODO need to use PCC here
+      CHERI_OP_B_PCC:     cheri_operand_b_o = pcc_id_i;
+      default:            cheri_operand_b_o = 'X;
+    endcase
+  end
+
 
   /////////////////////////////////////////
   // Multicycle Operation Stage Register //
@@ -408,14 +528,28 @@ module ibex_id_stage #(
   ///////////////////////
 
   // Suppress register write if there is an illegal CSR access or instruction is not executing
-  assign rf_we_id_o = rf_we_raw & instr_executing & ~illegal_csr_insn_i;
+  assign rf_we_id_o = rf_we_raw & instr_executing & ~illegal_csr_insn_i & ~illegal_scr_insn_i & ~id_exception;
 
   // Register file write data mux
   always_comb begin : rf_wdata_id_mux
+    rf_wcap_id_o      = cheri_wrote_cap_i & cheri_en_o;
     unique case (rf_wdata_sel)
-      RF_WD_EX:  rf_wdata_id_o = result_ex_i;
-      RF_WD_CSR: rf_wdata_id_o = csr_rdata_i;
-      default:   rf_wdata_id_o = result_ex_i;
+      RF_WD_EX: begin
+        // the CHERI ALU puts either an integer or a capability in the result line
+        // depending on the instruction; mux the integer result here here
+        rf_wdata_int_id_o = (cheri_en_o & !cheri_wrote_cap_i) ? cheri_result_ex_i[31:0]
+                                                              : result_ex_i;
+        rf_wdata_cap_id_o = cheri_result_ex_i;
+      end
+      RF_WD_CSR: begin
+        rf_wdata_int_id_o = csr_rdata_i;
+        rf_wdata_cap_id_o = scr_rdata_i;
+      end
+      default: begin
+        rf_wdata_int_id_o = (cheri_en_o & !cheri_wrote_cap_i) ? cheri_result_ex_i[31:0]
+                                                              : result_ex_i;
+        rf_wdata_cap_id_o = cheri_result_ex_i;
+      end
     endcase
   end
 
@@ -486,15 +620,40 @@ module ibex_id_stage #(
     .multdiv_operator_o   (multdiv_operator),
     .multdiv_signed_mode_o(multdiv_signed_mode),
 
+    // CHERI
+    .cheri_en_o            (cheri_en_o),
+    .cheri_base_opcode_o   (cheri_base_opcode_o),
+    .cheri_threeop_opcode_o(cheri_threeop_opcode_o),
+    .cheri_s_a_d_opcode_o  (cheri_s_a_d_opcode_o),
+    .cheri_alu_exc_only_o  (cheri_alu_exc_only_o),
+
+    .cap_mode_i (pcc_getFlags_o),
+    .priv_mode_i(priv_mode_i),
+
+    .add_auth_addr_o(lsu_add_auth_addr_o),
+
+    .cheri_op_a_mux_sel_o (cheri_op_a_mux_sel),
+    .cheri_op_b_mux_sel_o (cheri_op_b_mux_sel),
+    .cheri_imm_b_mux_sel_o(cheri_imm_b_mux_sel),
+    .cheri_a_en_o         (),
+    .cheri_b_en_o         (),
+
     // CSRs
     .csr_access_o(csr_access_o),
     .csr_op_o    (csr_op_o),
+
+    // SCRs
+    .scr_access_o(scr_access_o),
+    .scr_op_o    (scr_op_o),
 
     // LSU
     .data_req_o           (lsu_req_dec),
     .data_we_o            (lsu_we),
     .data_type_o          (lsu_type),
     .data_sign_extension_o(lsu_sign_ext),
+    .mem_cap_access_o     (lsu_wcap),
+
+    .mem_ddc_relative_o(mem_ddc_relative),
 
     // jump/branches
     .jump_in_dec_o  (jump_in_dec),
@@ -538,9 +697,10 @@ module ibex_id_stage #(
   assign illegal_umode_insn = (priv_mode_i != PRIV_LVL_M) &
                               // MRET must be in M-Mode. TW means trap WFI to M-Mode.
                               (mret_insn_dec | (csr_mstatus_tw_i & wfi_insn_dec));
+  assign mret_no_asr        = mret_insn_dec & ~pcc_has_asr;
 
   assign illegal_insn_o = instr_valid_i &
-      (illegal_insn_dec | illegal_csr_insn_i | illegal_dret_insn | illegal_umode_insn);
+      (illegal_insn_dec | illegal_csr_insn_i | illegal_scr_insn_i | illegal_dret_insn | illegal_umode_insn);
 
   ibex_controller #(
     .WritebackStage (WritebackStage),
@@ -569,6 +729,7 @@ module ibex_id_stage #(
     .instr_bp_taken_i       (instr_bp_taken_i),
     .instr_fetch_err_i      (instr_fetch_err_i),
     .instr_fetch_err_plus2_i(instr_fetch_err_plus2_i),
+    .instr_cheri_err_i      (instr_cheri_err_i),
     .pc_id_i                (pc_id_i),
 
     // to IF-ID pipeline
@@ -589,8 +750,22 @@ module ibex_id_stage #(
     .load_err_i     (lsu_load_err_i),
     .load_intg_err_i(lsu_load_intg_err_i),
     .store_err_i    (lsu_store_err_i),
+    .load_misalign_err_i (lsu_load_misalign_err_i),
+    .store_misalign_err_i(lsu_store_misalign_err_i),
+    .lsu_cheri_err_i(lsu_cheri_err_i),
     .wb_exception_o (wb_exception),
     .id_exception_o (id_exception),
+
+    // CHERI exceptions
+    .cheri_en_i             (cheri_en_o),
+    .cheri_alu_exc_only_i   (cheri_alu_exc_only_o),
+    .cheri_exceptions_a_ex_i(cheri_exceptions_a_ex_i),
+    .cheri_exceptions_b_ex_i(cheri_exceptions_b_ex_i),
+    .cheri_exceptions_lsu_i (cheri_exceptions_lsu_i),
+    .cheri_exceptions_if_i  (cheri_exceptions_if_i),
+    .scr_no_asr_i           (scr_no_asr_i),
+    .csr_no_asr_i           (csr_no_asr_i),
+    .mret_no_asr_i          (mret_no_asr),
 
     // jump/branch control
     .branch_set_i     (branch_set),
@@ -614,6 +789,13 @@ module ibex_id_stage #(
     .csr_mtval_o          (csr_mtval_o),
     .priv_mode_i          (priv_mode_i),
 
+    .cheri_exc_cause_o  (cheri_exc_cause_o),
+    .cheri_exc_reg_sel_o(cheri_exc_reg_sel_o),
+
+    .rf_raddr_a_i       (rf_raddr_a_o),
+    .rf_raddr_b_i       (rf_raddr_b_o),
+    .scr_addr_i         (scr_num_e'(cheri_operand_b_o[11:0])),
+
     // Debug Signal
     .debug_mode_o       (debug_mode_o),
     .debug_cause_o      (debug_cause_o),
@@ -630,6 +812,7 @@ module ibex_id_stage #(
     .ready_wb_i(ready_wb_i),
 
     // Performance Counters
+    .perf_xret_o   (perf_xret_o),
     .perf_jump_o   (perf_jump_o),
     .perf_tbranch_o(perf_tbranch_o)
   );
@@ -644,12 +827,16 @@ module ibex_id_stage #(
   assign lsu_we_o                = lsu_we;
   assign lsu_type_o              = lsu_type;
   assign lsu_sign_ext_o          = lsu_sign_ext;
-  assign lsu_wdata_o             = rf_rdata_b_fwd;
+  assign lsu_wdata_int_o         = rf_rdata_b_int_fwd;
+  assign lsu_wdata_cap_o         = rf_rdata_b_cap_fwd;
+  assign lsu_wcap_o              = lsu_wcap; // TODO allow writing capabilities
   // csr_op_en_o is set when CSR access should actually happen.
   // csv_access_o is set when CSR access instruction is present and is used to compute whether a CSR
   // access is illegal. A combinational loop would be created if csr_op_en_o was used along (as
   // asserting it for an illegal csr access would result in a flush that would need to deassert it).
+  // The same applies to SCRs
   assign csr_op_en_o             = csr_access_o & instr_executing & instr_id_done_o;
+  assign scr_op_en_o             = scr_access_o & instr_executing & instr_id_done_o;
 
   assign alu_operator_ex_o           = alu_operator;
   assign alu_operand_a_ex_o          = alu_operand_a;
@@ -660,8 +847,8 @@ module ibex_id_stage #(
 
   assign multdiv_operator_ex_o       = multdiv_operator;
   assign multdiv_signed_mode_ex_o    = multdiv_signed_mode;
-  assign multdiv_operand_a_ex_o      = rf_rdata_a_fwd;
-  assign multdiv_operand_b_ex_o      = rf_rdata_b_fwd;
+  assign multdiv_operand_a_ex_o      = rf_rdata_a_int_fwd;
+  assign multdiv_operand_b_ex_o      = rf_rdata_b_int_fwd;
 
   ////////////////////////
   // Branch set control //
@@ -830,7 +1017,9 @@ module ibex_id_stage #(
             jump_in_dec: begin
               // uncond branch operation
               // BTALU means jumps only need one cycle
-              id_fsm_d      = BranchTargetALU ? FIRST_CYCLE : MULTI_CYCLE;
+              // with CHERI, jumps can throw exceptions in ID (CJALR and
+              // CInvoke). When this is the case, go to FIRST_CYCLE
+              id_fsm_d      = BranchTargetALU | id_exception ? FIRST_CYCLE : MULTI_CYCLE;
               stall_jump    = ~BranchTargetALU;
               jump_set_raw  = jump_set_dec;
             end
@@ -987,8 +1176,10 @@ module ibex_id_stage #(
     // If instruction is read register that writeback is writing forward writeback data to read
     // data. Note this doesn't factor in load data as it arrives too late, such hazards are
     // resolved via a stall (see above).
-    assign rf_rdata_a_fwd = rf_rd_a_wb_match & rf_write_wb_i ? rf_wdata_fwd_wb_i : rf_rdata_a_i;
-    assign rf_rdata_b_fwd = rf_rd_b_wb_match & rf_write_wb_i ? rf_wdata_fwd_wb_i : rf_rdata_b_i;
+    assign rf_rdata_a_cap_fwd = rf_rd_a_wb_match & rf_write_wb_i ? rf_wdata_cap_fwd_wb_i : rf_rdata_a_cap_i;
+    assign rf_rdata_a_int_fwd = rf_rd_a_wb_match & rf_write_wb_i ? rf_wdata_int_fwd_wb_i : rf_rdata_a_int_i;
+    assign rf_rdata_b_cap_fwd = rf_rd_b_wb_match & rf_write_wb_i ? rf_wdata_cap_fwd_wb_i : rf_rdata_b_cap_i;
+    assign rf_rdata_b_int_fwd = rf_rd_b_wb_match & rf_write_wb_i ? rf_wdata_int_fwd_wb_i : rf_rdata_b_int_i;
 
     assign stall_ld_hz = outstanding_load_wb_i & (rf_rd_a_hz | rf_rd_b_hz);
 
@@ -1005,13 +1196,22 @@ module ibex_id_stage #(
                                (outstanding_memory_access | stall_ld_hz);
   end else begin : gen_no_stall_mem
 
-    assign multicycle_done = lsu_req_dec ? lsu_resp_valid_i : ex_valid_i;
+    // LSU requests that cause misaligned errors or CHERI exceptions will not
+    // receive responses, so set the "done" signal when we receive the error
+    assign multicycle_done = ~lsu_req_dec ? ex_valid_i
+                                          : lsu_resp_valid_i |
+                                            lsu_load_misalign_err_i |
+                                            lsu_store_misalign_err_i |
+                                            lsu_cheri_err_i;
 
     assign data_req_allowed = instr_first_cycle;
 
     // Without Writeback Stage always stall the first cycle of a load/store.
-    // Then stall until it is complete
-    assign stall_mem = instr_valid_i & (lsu_req_dec & (~lsu_resp_valid_i | instr_first_cycle));
+    // Then stall until it is complete or a CHERI LSU exception is thrown
+    assign stall_mem = instr_valid_i
+                     & lsu_req_dec
+                     & ~(lsu_cheri_err_i | lsu_load_misalign_err_i | lsu_store_misalign_err_i)
+                     & (~lsu_resp_valid_i | instr_first_cycle);
 
     // No load hazards without Writeback Stage
     assign stall_ld_hz   = 1'b0;
@@ -1025,8 +1225,10 @@ module ibex_id_stage #(
 
     // No data forwarding without writeback stage so always take source register data direct from
     // register file
-    assign rf_rdata_a_fwd = rf_rdata_a_i;
-    assign rf_rdata_b_fwd = rf_rdata_b_i;
+    assign rf_rdata_a_cap_fwd = rf_rdata_a_cap_i;
+    assign rf_rdata_a_int_fwd = rf_rdata_a_int_i;
+    assign rf_rdata_b_cap_fwd = rf_rdata_b_cap_i;
+    assign rf_rdata_b_int_fwd = rf_rdata_b_int_i;
 
     assign rf_rd_a_wb_match_o = 1'b0;
     assign rf_rd_b_wb_match_o = 1'b0;
@@ -1040,7 +1242,8 @@ module ibex_id_stage #(
     logic unused_outstanding_load_wb;
     logic unused_outstanding_store_wb;
     logic unused_wb_exception;
-    logic [31:0] unused_rf_wdata_fwd_wb;
+    logic [CheriCapWidth-1:0] unused_rf_wdata_cap_fwd_wb;
+    logic [31:0]              unused_rf_wdata_int_fwd_wb;
     logic unused_id_exception;
 
     assign unused_data_req_done_ex     = lsu_req_done_i;
@@ -1049,7 +1252,8 @@ module ibex_id_stage #(
     assign unused_outstanding_load_wb  = outstanding_load_wb_i;
     assign unused_outstanding_store_wb = outstanding_store_wb_i;
     assign unused_wb_exception         = wb_exception;
-    assign unused_rf_wdata_fwd_wb      = rf_wdata_fwd_wb_i;
+    assign unused_rf_wdata_cap_fwd_wb      = rf_wdata_cap_fwd_wb_i;
+    assign unused_rf_wdata_int_fwd_wb      = rf_wdata_int_fwd_wb_i;
     assign unused_id_exception         = id_exception;
 
     assign instr_type_wb_o = WB_INSTR_OTHER;
@@ -1063,7 +1267,7 @@ module ibex_id_stage #(
   // Signal which instructions to count as retired in minstret, all traps along with ebrk and
   // ecall instructions are not counted.
   assign instr_perf_count_id_o = ~ebrk_insn & ~ecall_insn_dec & ~illegal_insn_dec &
-      ~illegal_csr_insn_i & ~instr_fetch_err_i;
+      ~illegal_csr_insn_i & ~illegal_scr_insn_i & ~instr_fetch_err_i;
 
   // An instruction is ready to move to the writeback stage (or retire if there is no writeback
   // stage)
@@ -1071,6 +1275,20 @@ module ibex_id_stage #(
 
   assign perf_mul_wait_o = stall_multdiv & mult_en_dec;
   assign perf_div_wait_o = stall_multdiv & div_en_dec;
+
+  ////////////////////////////////
+  // CHERI module instantiation //
+  ////////////////////////////////
+
+  // PCC permissions
+  module_wrap64_getPerms pcc_getPerms (pcc_id_i, pcc_getPerms_o);
+  assign pcc_has_asr = pcc_getPerms_o[PermitAccessSysReg];
+
+  // PCC flag
+  module_wrap64_getFlags pcc_getFlags (pcc_id_i, pcc_getFlags_o);
+
+  // memory authorizing capability address
+  module_wrap64_getAddr auth_getAddr (lsu_mem_auth_cap_o, auth_getAddr_o);
 
   //////////
   // FCOV //
@@ -1111,7 +1329,7 @@ module ibex_id_stage #(
 
   // Branch decision must be valid when jumping.
   `ASSERT_KNOWN_IF(IbexBranchDecisionValid, branch_decision_i,
-      instr_valid_i && !(illegal_csr_insn_i || instr_fetch_err_i))
+      instr_valid_i && !(illegal_csr_insn_i || illegal_scr_insn_i || instr_fetch_err_i))
 
   // Instruction delivered to ID stage can not contain X.
   `ASSERT_KNOWN_IF(IbexIdInstrKnown, instr_rdata_i,

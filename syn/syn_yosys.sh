@@ -75,6 +75,9 @@ for file in ../rtl/*.sv; do
   sed -i 's/prim_buf/prim_generic_buf/g'  $LR_SYNTH_OUT_DIR/generated/${module}.v
 done
 
+# copy cheri-cap-lib generated verilog files
+cp ../vendor/cheri-cap-lib/*.v $LR_SYNTH_OUT_DIR/generated/
+
 # remove tracer (not needed for synthesis)
 rm -f $LR_SYNTH_OUT_DIR/generated/ibex_tracer.v
 

@@ -151,6 +151,12 @@ parameters:
     default: 40
     description: Bit width of performance monitor event counters [32/64]
 
+  TestRIG:
+    datatype: int
+    paramtype: vlogparam
+    default: 0
+    description: "Whether TestRIG support should be enabled"
+
 targets:
   default: &default_target
     filesets:

@@ -1,0 +1,49 @@
+diff --git a/cheri-cap-lib-verilog-wrappers.core b/cheri-cap-lib-verilog-wrappers.core
+new file mode 100644
+index 0000000..7c938a4
+--- /dev/null
++++ b/cheri-cap-lib-verilog-wrappers.core
+@@ -0,0 +1,43 @@
++CAPI=2:
++name: "ucam:cheri:cheri-cap-lib-verilog-wrappers"
++description: "Generates Verilog versions of the cheri-cap-lib functions"
++
++filesets:
++  files_v:
++    files:
++      - module_wrap64_almightyCap.v
++      - module_wrap64_fromMem.v
++      - module_wrap64_getAddr.v
++      - module_wrap64_getBase.v
++      - module_wrap64_getFlags.v
++      - module_wrap64_getHardPerms.v
++      - module_wrap64_getKind.v
++      - module_wrap64_getLength.v
++      - module_wrap64_getOffset.v
++      - module_wrap64_getPerms.v
++      - module_wrap64_getSoftPerms.v
++      - module_wrap64_getTop.v
++      - module_wrap64_incOffset.v
++      - module_wrap64_isInBounds.v
++      - module_wrap64_isValidCap.v
++      - module_wrap64_modifyOffset.v
++      - module_wrap64_nullCap.v
++      - module_wrap64_nullWithAddr.v
++      - module_wrap64_setAddr.v
++      - module_wrap64_setBounds.v
++      - module_wrap64_setFlags.v
++      - module_wrap64_setHardPerms.v
++      - module_wrap64_setKind.v
++      - module_wrap64_setOffset.v
++      - module_wrap64_setPerms.v
++      - module_wrap64_setSoftPerms.v
++      - module_wrap64_setValidCap.v
++      - module_wrap64_toMem.v
++      - module_wrap64_validAsType.v
++    file_type: verilogSource
++
++targets:
++  default:
++    description: "Default target that contains the Verilog files"
++    filesets:
++      - files_v

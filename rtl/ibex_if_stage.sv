@@ -27,7 +27,11 @@ module ibex_if_stage import ibex_pkg::*; #(
   parameter lfsr_perm_t  RndCnstLfsrPerm   = RndCnstLfsrPermDefault,
   parameter bit          BranchPredictor   = 1'b0,
   parameter bit          MemECC            = 1'b0,
-  parameter int unsigned MemDataWidth      = MemECC ? 32 + 7 : 32
+  parameter int unsigned MemDataWidth      = MemECC ? 32 + 7 : 32,
+  parameter int unsigned CheriCapWidth     = 91,
+  parameter bit [CheriCapWidth-1:0] CheriAlmightyCap  = 91'h0,
+  parameter bit [CheriCapWidth-1:0] CheriNullCap      = 91'h0,
+  parameter int          TestRIG           = 0
 ) (
   input  logic                         clk_i,
   input  logic                         rst_ni,
@@ -43,6 +47,11 @@ module ibex_if_stage import ibex_pkg::*; #(
   input  logic [MemDataWidth-1:0]     instr_rdata_i,
   input  logic                        instr_bus_err_i,
   output logic                        instr_intg_err_o,
+
+  // CHERI exceptions
+  input ibex_pkg::cheri_exc_t         instr_cheri_exc_i,
+  input logic                         instr_upper_exc_i,
+  input logic                         instr_upper_exc_2_i,
 
   // ICache RAM IO
   output logic [IC_NUM_WAYS-1:0]      ic_tag_req_o,
@@ -71,14 +80,24 @@ module ibex_if_stage import ibex_pkg::*; #(
   output logic                        instr_bp_taken_o,         // instruction was predicted to be
                                                                 // a taken branch
   output logic                        instr_fetch_err_o,        // bus error on fetch
+  output logic                        instr_cheri_err_o,        // cheri error on fetch
   output logic                        instr_fetch_err_plus2_o,  // bus error misaligned
   output logic                        illegal_c_insn_id_o,      // compressed decoder thinks this
                                                                 // is an invalid instr
   output logic                        dummy_instr_id_o,         // Instruction is a dummy
+  output logic [CheriCapWidth-1:0]    instr_fetch_auth_o,       // The authority for the current instruction fetch
   output logic [31:0]                 pc_if_o,
+  output logic [CheriCapWidth-1:0]    pcc_if_o,
   output logic [31:0]                 pc_id_o,
+  output logic [CheriCapWidth-1:0]    pcc_id_o,
   input  logic                        pmp_err_if_i,
   input  logic                        pmp_err_if_plus2_i,
+
+`ifdef RVFI
+  output logic                        perf_if_cheri_err_o,
+`endif
+
+  output ibex_pkg::cheri_exc_t instr_cheri_exc_o, // CHERI exceptions thrown by fetch
 
   // control signals
   input  logic                        instr_valid_clear_i,      // clear instr valid bit in IF-ID
@@ -90,6 +109,7 @@ module ibex_if_stage import ibex_pkg::*; #(
   input  exc_pc_sel_e                 exc_pc_mux_i,             // selects ISR address
   input  exc_cause_t                  exc_cause,                // selects ISR address for
                                                                 // vectorized interrupt lines
+  input  logic                        branch_is_cap_i,
   input  logic                        dummy_instr_en_i,
   input  logic [2:0]                  dummy_instr_mask_i,
   input  logic                        dummy_instr_seed_en_i,
@@ -99,15 +119,21 @@ module ibex_if_stage import ibex_pkg::*; #(
   output logic                        icache_ecc_error_o,
 
   // jump and branch target
-  input  logic [31:0]                 branch_target_ex_i,       // branch/jump target address
+  input  logic [CheriCapWidth-1:0]    branch_target_cap_ex_i,   // branch/jump target capability
+  input  logic [31:0]                 branch_target_int_ex_i,   // branch/jump target offset
+  output logic [31:0]                 pc_set_target_o,          // when PC is set, this will be the
+                                                                // PC that will be jumped to
+                                                                // (used for RVFI)
 
   // CSRs
   input  logic [31:0]                 csr_mepc_i,               // PC to restore after handling
                                                                 // the interrupt/exception
+  input  logic [CheriCapWidth-1:0]    scr_mepcc_i,
   input  logic [31:0]                 csr_depc_i,               // PC to restore after handling
                                                                 // the debug request
   input  logic [31:0]                 csr_mtvec_i,              // base PC to jump to on exception
   output logic                        csr_mtvec_init_o,         // tell CS regfile to init mtvec
+  input  logic [CheriCapWidth-1:0]    scr_mtcc_i,
 
   // pipeline stall
   input  logic                        id_in_ready_i,            // ID stage is ready for new instr
@@ -122,22 +148,44 @@ module ibex_if_stage import ibex_pkg::*; #(
 
   logic              instr_err, instr_intg_err;
 
+  // instruction-specific exceptions
+  cheri_instr_exc_t  instr_cheri_instr_exc;
+
+  logic              instr_cheri_len_exc;
+  logic              instr_lower_exc;
+
+  // whether the next error to come out of the prefetch fifo was a CHERI error
+  logic                     err_is_cheri_q;
+  // tracks whether there is an error in the fifo.
+  // needed because if multiple errors come in we do not want to overwrite
+  // error data. The first error encountered will flush all the subsequent
+  // ones that are in the pipeline.
+  logic                     err_in_fifo_q;
+
+  // The PCC of the instruction returned by the prefetcher/cache last cycle.
+  // When a jump occurs, this is updated to the jump target (and then not
+  // updated again until after the jump target instruction is returned by the
+  // prefetcher/cache).
+  logic [CheriCapWidth-1:0] pcc_q;
+
   // prefetch buffer related signals
   logic              prefetch_busy;
   logic              branch_req;
-  logic       [31:0] fetch_addr_n;
-  logic              unused_fetch_addr_n0;
+  logic       [31:0] fetch_offset_n;
 
   logic              prefetch_branch;
   logic [31:0]       prefetch_addr;
 
   logic              fetch_valid_raw;
   logic              fetch_valid;
+  logic              fetch_imm;
   logic              fetch_ready;
   logic       [31:0] fetch_rdata;
   logic       [31:0] fetch_addr;
   logic              fetch_err;
   logic              fetch_err_plus2;
+  cheri_instr_exc_t  fetch_cheri_err;
+  logic              fetch_cheri_len_err;
 
   logic [31:0]       instr_decompressed;
   logic              illegal_c_insn;
@@ -150,8 +198,10 @@ module ibex_if_stage import ibex_pkg::*; #(
   logic              if_instr_pmp_err;
   logic              if_instr_err;
   logic              if_instr_err_plus2;
+  logic              if_instr_cheri_err;
 
   logic       [31:0] exc_pc;
+  logic [CheriCapWidth-1:0] exc_pcc;
 
   logic              if_id_pipe_reg_we; // IF-ID pipeline reg write enable
 
@@ -163,7 +213,7 @@ module ibex_if_stage import ibex_pkg::*; #(
   logic              instr_err_out;
 
   logic              predict_branch_taken;
-  logic       [31:0] predict_branch_pc;
+  logic       [31:0] predict_branch_addr;
 
   logic        [4:0] irq_vec;
 
@@ -172,6 +222,35 @@ module ibex_if_stage import ibex_pkg::*; #(
   logic        [7:0] unused_boot_addr;
   logic        [7:0] unused_csr_mtvec;
   logic              unused_exc_cause;
+
+  logic              unused_pcc_setOffset_exact, unused_jump_pcc_setOffset_exact;
+
+  // The PCC that might be jumped to (depending on whether the pc_set_i signal
+  // is high this cycle)
+  logic [CheriCapWidth-1:0] jump_pcc;
+  logic [CheriCapWidth-1:0] jump_pcc_setOffset_cap;
+  logic [31:0]              jump_pcc_newOffset;
+
+  // The PCC assuming no jump (ie the PCC of the instruction being returned by
+  // the prefetcher/cache this cycle)
+  logic [CheriCapWidth-1:0] nojump_pcc;
+  logic [31:0]              nojump_pcc_getBase_o;
+
+  // The new PCC (already muxed between continuing with current PCC or using
+  // the calculated jump PCC)
+  // On jump, this is the PCC of the instruction that is being requested from
+  // memory.
+  // When not jumping, this is the PCC of the instruction that is being
+  // returned by the prefetcher/cache.
+  logic [CheriCapWidth-1:0] new_pcc;
+  logic [31:0]              new_pcc_getAddr_o;
+
+  // used to unseal MEPCC when it is a sentry
+  logic [ CheriCapWidth-1:0] mepcc_setKind_o;
+  logic [CheriKindWidth-1:0] mepcc_getKind_o;
+
+  // used to unseal the capability being jumped to
+  logic [CheriCapWidth-1:0] branch_target_setKind_o;
 
   assign unused_boot_addr = boot_addr_i[7:0];
   assign unused_csr_mtvec = csr_mtvec_i[7:0];
@@ -188,11 +267,28 @@ module ibex_if_stage import ibex_pkg::*; #(
     end
 
     unique case (exc_pc_mux_i)
-      EXC_PC_EXC:     exc_pc = { csr_mtvec_i[31:8], 8'h00                };
-      EXC_PC_IRQ:     exc_pc = { csr_mtvec_i[31:8], 1'b0, irq_vec, 2'b00 };
-      EXC_PC_DBD:     exc_pc = DmHaltAddr;
-      EXC_PC_DBG_EXC: exc_pc = DmExceptionAddr;
-      default:        exc_pc = { csr_mtvec_i[31:8], 8'h00                };
+      EXC_PC_EXC: begin
+        // PC is only set to MTVEC here for RVFI reporting; only PCC matters
+        // for control flow
+        exc_pc  = { csr_mtvec_i[31:2], 2'b00};
+        exc_pcc = scr_mtcc_i;
+      end
+      EXC_PC_IRQ: begin
+        exc_pc  = { csr_mtvec_i[31:8], 1'b0, irq_vec, 2'b00 };
+        exc_pcc = scr_mtcc_i;
+      end
+      EXC_PC_DBD: begin
+        exc_pc  = DmHaltAddr;
+        exc_pcc = pcc_q;
+      end
+      EXC_PC_DBG_EXC: begin
+        exc_pc  = DmExceptionAddr;
+        exc_pcc = pcc_q;
+      end
+      default: begin
+        exc_pc  = '0;
+        exc_pcc = scr_mtcc_i;
+      end
     endcase
   end
 
@@ -201,20 +297,50 @@ module ibex_if_stage import ibex_pkg::*; #(
   assign pc_mux_internal =
     (BranchPredictor && predict_branch_taken && !pc_set_i) ? PC_BP : pc_mux_i;
 
-  // fetch address selection mux
-  always_comb begin : fetch_addr_mux
+  // fetch offset selection mux
+  always_comb begin : fetch_offset_mux
     unique case (pc_mux_internal)
-      PC_BOOT: fetch_addr_n = { boot_addr_i[31:8], 8'h80 };
-      PC_JUMP: fetch_addr_n = branch_target_ex_i;
-      PC_EXC:  fetch_addr_n = exc_pc;                       // set PC to exception handler
-      PC_ERET: fetch_addr_n = csr_mepc_i;                   // restore PC when returning from EXC
-      PC_DRET: fetch_addr_n = csr_depc_i;
+      PC_BOOT: begin
+        // TODO TestRIG does not support having an offset of 80 in the reset PC
+        if (TestRIG==1) begin
+            fetch_offset_n    = boot_addr_i;
+        end else begin
+            fetch_offset_n    = {boot_addr_i[31:8], 8'h80};
+        end
+        jump_pcc_setOffset_cap = CheriAlmightyCap;
+      end
+      PC_JUMP: begin
+        fetch_offset_n    = {branch_target_int_ex_i[31:1], 1'b0};
+        jump_pcc_setOffset_cap = branch_is_cap_i ? branch_target_setKind_o : pcc_q;
+      end
+      PC_EXC: begin
+        fetch_offset_n    = exc_pc;                       // set PC to exception handler
+        jump_pcc_setOffset_cap = exc_pcc;
+      end
+      PC_ERET: begin
+        fetch_offset_n    = csr_mepc_i;                   // restore PC when returning from EXC
+        // if mepcc is sealed as a Sentry, unseal it
+        jump_pcc_setOffset_cap = mepcc_getKind_o == 7'h1E ? mepcc_setKind_o : scr_mepcc_i;
+      end
+      PC_DRET: begin
+        fetch_offset_n    = csr_depc_i;
+        jump_pcc_setOffset_cap = pcc_q;
+      end
       // Without branch predictor will never get pc_mux_internal == PC_BP. We still handle no branch
       // predictor case here to ensure redundant mux logic isn't synthesised.
-      PC_BP:   fetch_addr_n = BranchPredictor ? predict_branch_pc : { boot_addr_i[31:8], 8'h80 };
-      default: fetch_addr_n = { boot_addr_i[31:8], 8'h80 };
+      PC_BP: begin
+        // TODO TestRIG does not support having an offset of 80 in the reset PC
+        fetch_offset_n    = BranchPredictor ? predict_branch_addr - nojump_pcc_getBase_o : boot_addr_i;
+        jump_pcc_setOffset_cap = pcc_q;
+      end
+      default: begin
+        fetch_offset_n    = boot_addr_i;
+        jump_pcc_setOffset_cap = pcc_q;
+      end
     endcase
   end
+
+  assign pc_set_target_o = fetch_offset_n;
 
   // tell CS register file to initialize mtvec on boot
   assign csr_mtvec_init_o = (pc_mux_i == PC_BOOT) & pc_set_i;
@@ -242,14 +368,32 @@ module ibex_if_stage import ibex_pkg::*; #(
     assign instr_intg_err            = 1'b0;
   end
 
-  assign instr_err        = instr_intg_err | instr_bus_err_i;
+  // instr_cheri_exc_i.length_violation tells us whether the first halfword
+  // would cause an exception when fetched
+  assign instr_lower_exc = instr_cheri_exc_i.length_violation;
+
+  // if both halves of this access were disallowed, then it would definitely
+  // cause an exception regardless of whether we were just fetching the upper
+  // part or just the lower part
+  assign instr_cheri_len_exc = instr_lower_exc & instr_upper_exc_i;
+
+  always_comb begin
+    instr_cheri_instr_exc.tag_violation            = instr_cheri_exc_i.tag_violation;
+    instr_cheri_instr_exc.seal_violation           = instr_cheri_exc_i.seal_violation;
+    instr_cheri_instr_exc.permit_execute_violation = instr_cheri_exc_i.permit_execute_violation;
+  end
+
+  assign instr_err = instr_intg_err | instr_bus_err_i;
+
   assign instr_intg_err_o = instr_intg_err & instr_rvalid_i;
 
   // There are two possible "branch please" signals that are computed in the IF stage: branch_req
   // and nt_branch_mispredict_i. These should be mutually exclusive (see the NoMispredBranch
   // assertion), so we can just OR the signals together.
+  // The prefetchers (cache and prefetch buffer) handle _addresses_ since they directly control the
+  // memory interface
   assign prefetch_branch = branch_req | nt_branch_mispredict_i;
-  assign prefetch_addr   = branch_req ? {fetch_addr_n[31:1], 1'b0} : nt_branch_addr_i;
+  assign prefetch_addr   = new_pcc_getAddr_o;
 
   // The fetch_valid signal that comes out of the icache or prefetch buffer should be squashed if we
   // had a misprediction.
@@ -310,7 +454,8 @@ module ibex_if_stage import ibex_pkg::*; #(
   end else begin : gen_prefetch_buffer
     // prefetch buffer, caches a fixed number of instructions
     ibex_prefetch_buffer #(
-      .ResetAll        (ResetAll)
+      .ResetAll        (ResetAll),
+      .TestRIG         (TestRIG)
     ) prefetch_buffer_i (
         .clk_i               ( clk_i                      ),
         .rst_ni              ( rst_ni                     ),
@@ -322,10 +467,13 @@ module ibex_if_stage import ibex_pkg::*; #(
 
         .ready_i             ( fetch_ready                ),
         .valid_o             ( fetch_valid_raw            ),
+        .imm_o               ( fetch_imm                  ),
         .rdata_o             ( fetch_rdata                ),
         .addr_o              ( fetch_addr                 ),
         .err_o               ( fetch_err                  ),
         .err_plus2_o         ( fetch_err_plus2            ),
+        .cheri_err_o         ( fetch_cheri_err            ),
+        .cheri_len_err_o     ( fetch_cheri_len_err        ),
 
         .instr_req_o         ( instr_req_o                ),
         .instr_addr_o        ( instr_addr_o               ),
@@ -333,7 +481,14 @@ module ibex_if_stage import ibex_pkg::*; #(
         .instr_rvalid_i      ( instr_rvalid_i             ),
         .instr_rdata_i       ( instr_rdata_i[31:0]        ),
         .instr_err_i         ( instr_err                  ),
+        .instr_cheri_err_i         ( instr_cheri_instr_exc),
+        .instr_cheri_lower_err_i   ( instr_lower_exc      ),
+        .instr_cheri_upper_err_i   ( instr_upper_exc_i    ),
+        .instr_cheri_upper_err_2_i ( instr_upper_exc_2_i  ),
 
+`ifdef RVFI
+        .perf_if_cheri_err_o ( perf_if_cheri_err_o        ),
+`endif
         .busy_o              ( prefetch_busy              )
     );
     // ICache tieoffs
@@ -372,11 +527,13 @@ module ibex_if_stage import ibex_pkg::*; #(
 `endif
   end
 
-  assign unused_fetch_addr_n0 = fetch_addr_n[0];
-
   assign branch_req  = pc_set_i | predict_branch_taken;
 
-  assign pc_if_o     = if_instr_addr;
+  // the prefetchers (ICache or prefetch buffer) control what the next
+  // instruction is, so we need to calculate the PC based on the address that
+  // they give out
+  assign pc_if_o     = if_instr_addr - nojump_pcc_getBase_o;
+  // pcc_if_o is assigned in the CHERI instantiations;
   assign if_busy_o   = prefetch_busy;
 
   // PMP errors
@@ -385,8 +542,8 @@ module ibex_if_stage import ibex_pkg::*; #(
   assign if_instr_pmp_err = pmp_err_if_i |
                             (if_instr_addr[2] & ~instr_is_compressed & pmp_err_if_plus2_i);
 
-  // Combine bus errors and pmp errors
-  assign if_instr_err = if_instr_bus_err | if_instr_pmp_err;
+  // Combine bus errors, pmp errors and cheri errors
+  assign if_instr_err = if_instr_bus_err | if_instr_pmp_err | if_instr_cheri_err;
 
   // Capture the second half of the address for errors on the second part of an instruction
   assign if_instr_err_plus2 = ((if_instr_addr[2] & ~instr_is_compressed & pmp_err_if_plus2_i) |
@@ -400,7 +557,7 @@ module ibex_if_stage import ibex_pkg::*; #(
   ibex_compressed_decoder compressed_decoder_i (
     .clk_i          (clk_i),
     .rst_ni         (rst_ni),
-    .valid_i        (fetch_valid & ~fetch_err),
+    .valid_i        (fetch_valid & ~fetch_err & ~(|fetch_cheri_err)),
     .instr_i        (if_instr_rdata),
     .instr_o        (instr_decompressed),
     .is_compressed_o(instr_is_compressed),
@@ -497,35 +654,46 @@ module ibex_if_stage import ibex_pkg::*; #(
         instr_rdata_id_o         <= '0;
         instr_rdata_alu_id_o     <= '0;
         instr_fetch_err_o        <= '0;
+        instr_cheri_err_o        <= '0;
         instr_fetch_err_plus2_o  <= '0;
         instr_rdata_c_id_o       <= '0;
         instr_is_compressed_id_o <= '0;
         illegal_c_insn_id_o      <= '0;
         pc_id_o                  <= '0;
-      end else if (if_id_pipe_reg_we) begin
-        instr_rdata_id_o         <= instr_out;
-        // To reduce fan-out and help timing from the instr_rdata_id flops they are replicated.
-        instr_rdata_alu_id_o     <= instr_out;
-        instr_fetch_err_o        <= instr_err_out;
-        instr_fetch_err_plus2_o  <= if_instr_err_plus2;
-        instr_rdata_c_id_o       <= if_instr_rdata[15:0];
-        instr_is_compressed_id_o <= instr_is_compressed_out;
-        illegal_c_insn_id_o      <= illegal_c_instr_out;
-        pc_id_o                  <= pc_if_o;
+        pcc_id_o                 <= CheriNullCap;
+        pcc_q                    <= CheriAlmightyCap;
+      end else begin
+        pcc_q <= new_pcc;
+        if (if_id_pipe_reg_we) begin
+          instr_rdata_id_o         <= instr_out;
+          // To reduce fan-out and help timing from the instr_rdata_id flops they are replicated.
+          instr_rdata_alu_id_o     <= instr_out;
+          instr_fetch_err_o        <= instr_err_out;
+          instr_cheri_err_o        <= instr_err_out & if_instr_cheri_err;
+          instr_fetch_err_plus2_o  <= if_instr_err_plus2;
+          instr_rdata_c_id_o       <= if_instr_rdata[15:0];
+          instr_is_compressed_id_o <= instr_is_compressed_out;
+          illegal_c_insn_id_o      <= illegal_c_instr_out;
+          pc_id_o                  <= pc_if_o;
+          pcc_id_o                 <= new_pcc;
+        end
       end
     end
   end else begin : g_instr_rdata_nr
     always_ff @(posedge clk_i) begin
+      pcc_q <= new_pcc;
       if (if_id_pipe_reg_we) begin
         instr_rdata_id_o         <= instr_out;
         // To reduce fan-out and help timing from the instr_rdata_id flops they are replicated.
         instr_rdata_alu_id_o     <= instr_out;
         instr_fetch_err_o        <= instr_err_out;
+        instr_cheri_err_o        <= instr_err_out & if_instr_cheri_err;
         instr_fetch_err_plus2_o  <= if_instr_err_plus2;
         instr_rdata_c_id_o       <= if_instr_rdata[15:0];
         instr_is_compressed_id_o <= instr_is_compressed_out;
         illegal_c_insn_id_o      <= illegal_c_instr_out;
         pc_id_o                  <= pc_if_o;
+        pcc_id_o                 <= new_pcc;
       end
     end
   end
@@ -642,7 +810,7 @@ module ibex_if_stage import ibex_pkg::*; #(
       .fetch_valid_i(fetch_valid),
 
       .predict_branch_taken_o(predict_branch_taken_raw),
-      .predict_branch_pc_o   (predict_branch_pc)
+      .predict_branch_pc_o   (predict_branch_addr)
     );
 
     // If there is an instruction in the skid buffer there must be no branch prediction.
@@ -669,14 +837,49 @@ module ibex_if_stage import ibex_pkg::*; #(
   end else begin : g_no_branch_predictor
     assign instr_bp_taken_o     = 1'b0;
     assign predict_branch_taken = 1'b0;
-    assign predict_branch_pc    = 32'b0;
+    assign predict_branch_addr  = 32'b0;
 
     assign if_instr_valid = fetch_valid;
     assign if_instr_rdata = fetch_rdata;
     assign if_instr_addr  = fetch_addr;
     assign if_instr_bus_err = fetch_err;
+    assign if_instr_cheri_err = (|fetch_cheri_err) | fetch_cheri_len_err;
     assign fetch_ready = id_in_ready_i & ~stall_dummy_instr;
   end
+
+  // CHERI exception output
+  always_comb begin
+    // Instruction CHERI exceptions are calculated when the request is made,
+    // and go through the prefetch buffer and fetch fifo with the instruction
+    // data. The exception signals are extracted here.
+    instr_cheri_exc_o                          = cheri_exc_t'(0);
+    instr_cheri_exc_o.tag_violation            = fetch_cheri_err.tag_violation;
+    instr_cheri_exc_o.seal_violation           = fetch_cheri_err.seal_violation;
+    instr_cheri_exc_o.permit_execute_violation = fetch_cheri_err.permit_execute_violation;
+    instr_cheri_exc_o.length_violation         = fetch_cheri_len_err;
+  end
+
+  assign new_pcc            = pc_set_i ? jump_pcc : pcc_if_o;
+  assign pcc_if_o           = nojump_pcc;
+  assign instr_fetch_auth_o = pc_set_i ? jump_pcc_setOffset_cap : pcc_q;
+
+  // CHERI module instantiations
+  // set the offsets of the potential new PCCs
+  module_wrap64_setOffset pcc_setOffset(pcc_q, pc_if_o, {unused_pcc_setOffset_exact, nojump_pcc});
+  module_wrap64_setOffset jump_pcc_setOffset(jump_pcc_setOffset_cap, fetch_offset_n, {unused_jump_pcc_setOffset_exact, jump_pcc});
+
+  // the address of the new PCC, used for fetching
+  module_wrap64_getAddr   new_pcc_getAddr  (new_pcc, new_pcc_getAddr_o);
+
+  // The base is not changed by modifying the offset, so just use the
+  // registered value
+  module_wrap64_getBase   pcc_getBase (pcc_q, nojump_pcc_getBase_o);
+
+  // On jumps and exceptions, unsealed versions of the target and of MEPCC are
+  // needed.
+  module_wrap64_setKind   mepcc_setKind  (scr_mepcc_i, 7'h0F, mepcc_setKind_o);
+  module_wrap64_getKind   mepcc_getKind  (scr_mepcc_i, mepcc_getKind_o);
+  module_wrap64_setKind   target_setKind (branch_target_cap_ex_i, 7'h0F, branch_target_setKind_o);
 
   ////////////////
   // Assertions //
@@ -715,11 +918,11 @@ module ibex_if_stage import ibex_pkg::*; #(
     logic        predicted_branch_live_q, predicted_branch_live_d;
     logic [31:0] predicted_branch_nt_pc_q, predicted_branch_nt_pc_d;
     logic [31:0] awaiting_instr_after_mispredict_q, awaiting_instr_after_mispredict_d;
-    logic [31:0] next_pc;
+    logic [31:0] next_addr;
 
     logic mispredicted, mispredicted_d, mispredicted_q;
 
-    assign next_pc = fetch_addr + (instr_is_compressed_out ? 32'd2 : 32'd4);
+    assign next_addr = fetch_addr + (instr_is_compressed_out ? 32'd2 : 32'd4);
 
     logic predicted_branch;
 
@@ -754,7 +957,7 @@ module ibex_if_stage import ibex_pkg::*; #(
 
     always @(posedge clk_i) begin
       if (branch_req & predicted_branch) begin
-        predicted_branch_nt_pc_q <= next_pc;
+        predicted_branch_nt_pc_q <= next_addr;
       end
     end
 

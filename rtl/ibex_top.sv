@@ -21,7 +21,7 @@ module ibex_top import ibex_pkg::*; #(
   parameter bit          RV32E            = 1'b0,
   parameter rv32m_e      RV32M            = RV32MFast,
   parameter rv32b_e      RV32B            = RV32BNone,
-  parameter regfile_e    RegFile          = RegFileFF,
+  parameter regfile_e    RegFile          = RegFileFPGA,
   parameter bit          BranchTargetALU  = 1'b0,
   parameter bit          WritebackStage   = 1'b0,
   parameter bit          ICache           = 1'b0,
@@ -35,6 +35,7 @@ module ibex_top import ibex_pkg::*; #(
   parameter lfsr_perm_t  RndCnstLfsrPerm  = RndCnstLfsrPermDefault,
   parameter int unsigned DmHaltAddr       = 32'h1A110800,
   parameter int unsigned DmExceptionAddr  = 32'h1A110808,
+  parameter int          TestRIG          = 0,
   // Default seed and nonce for scrambling
   parameter logic [SCRAMBLE_KEY_W-1:0]   RndCnstIbexKey   = RndCnstIbexKeyDefault,
   parameter logic [SCRAMBLE_NONCE_W-1:0] RndCnstIbexNonce = RndCnstIbexNonceDefault
@@ -65,9 +66,9 @@ module ibex_top import ibex_pkg::*; #(
   output logic                         data_we_o,
   output logic [3:0]                   data_be_o,
   output logic [31:0]                  data_addr_o,
-  output logic [31:0]                  data_wdata_o,
+  output logic [32:0]                  data_wdata_o,
   output logic [6:0]                   data_wdata_intg_o,
-  input  logic [31:0]                  data_rdata_i,
+  input  logic [32:0]                  data_rdata_i,
   input  logic [6:0]                   data_rdata_intg_i,
   input  logic                         data_err_i,
 
@@ -112,14 +113,21 @@ module ibex_top import ibex_pkg::*; #(
   output logic [31:0]                  rvfi_pc_rdata,
   output logic [31:0]                  rvfi_pc_wdata,
   output logic [31:0]                  rvfi_mem_addr,
-  output logic [ 3:0]                  rvfi_mem_rmask,
-  output logic [ 3:0]                  rvfi_mem_wmask,
-  output logic [31:0]                  rvfi_mem_rdata,
-  output logic [31:0]                  rvfi_mem_wdata,
+  output logic [ 7:0]                  rvfi_mem_rmask,
+  output logic [ 7:0]                  rvfi_mem_wmask,
+  output logic [63:0]                  rvfi_mem_rdata,
+  output logic [63:0]                  rvfi_mem_wdata,
   output logic [31:0]                  rvfi_ext_mip,
   output logic                         rvfi_ext_nmi,
   output logic                         rvfi_ext_debug_req,
   output logic [63:0]                  rvfi_ext_mcycle,
+  output logic                         perf_xret_o,
+  output logic                         perf_jump_o,
+  output logic                         perf_tbranch_o,
+  // Used in RVFI-DII to signal an instruction fetch that led to a CHERI exception.
+  // Such a fetch will not issue a request, so we need this to signal that
+  // there was a fetch but it failed so the replay buffer can remain in sync
+  output logic                         perf_if_cheri_err_o,
 `endif
 
   // CPU Control Signals
@@ -136,11 +144,14 @@ module ibex_top import ibex_pkg::*; #(
   localparam bit          Lockstep          = SecureIbex;
   localparam bit          ResetAll          = Lockstep;
   localparam bit          DummyInstructions = SecureIbex;
+  localparam int unsigned CheriCapWidth     = 91;
+  localparam bit [90:0]   CheriNullCap      = 91'h00000000000001F690003F0;
+  localparam bit [90:0]   CheriAlmightyCap  = 91'h40000000003FFDF690003F0;
   localparam bit          RegFileECC        = SecureIbex;
   localparam bit          RegFileWrenCheck  = SecureIbex;
-  localparam int unsigned RegFileDataWidth  = RegFileECC ? 32 + 7 : 32;
+  localparam int unsigned RegFileDataWidth  = CheriCapWidth;
   localparam bit          MemECC            = SecureIbex;
-  localparam int unsigned MemDataWidth      = MemECC ? 32 + 7 : 32;
+  localparam int unsigned MemDataWidth      = MemECC ? 32 + 7 : 33;
   // Icache parameters
   localparam int unsigned BusSizeECC        = ICacheECC ? (BUS_SIZE + 7) : BUS_SIZE;
   localparam int unsigned LineSizeECC       = BusSizeECC * IC_LINE_BEATS;
@@ -238,7 +249,7 @@ module ibex_top import ibex_pkg::*; #(
 
   // ibex_core takes integrity and data bits together. Combine the separate integrity and data
   // inputs here.
-  assign data_rdata_core[31:0] = data_rdata_i;
+  assign data_rdata_core[MemDataWidth-1:0] = data_rdata_i;
   assign instr_rdata_core[31:0] = instr_rdata_i;
 
   if (MemECC) begin : gen_mem_rdata_ecc
@@ -274,12 +285,16 @@ module ibex_top import ibex_pkg::*; #(
     .RndCnstLfsrPerm  (RndCnstLfsrPerm),
     .SecureIbex       (SecureIbex),
     .DummyInstructions(DummyInstructions),
+    .CheriCapWidth    (CheriCapWidth),
+    .CheriAlmightyCap (CheriAlmightyCap),
+    .CheriNullCap     (CheriNullCap),
     .RegFileECC       (RegFileECC),
     .RegFileDataWidth (RegFileDataWidth),
     .MemECC           (MemECC),
     .MemDataWidth     (MemDataWidth),
     .DmHaltAddr       (DmHaltAddr),
-    .DmExceptionAddr  (DmExceptionAddr)
+    .DmExceptionAddr  (DmExceptionAddr),
+    .TestRIG          (TestRIG)
   ) u_ibex_core (
     .clk_i(clk),
     .rst_ni,
@@ -364,6 +379,10 @@ module ibex_top import ibex_pkg::*; #(
     .rvfi_ext_nmi,
     .rvfi_ext_debug_req,
     .rvfi_ext_mcycle,
+    .perf_xret_o,
+    .perf_jump_o,
+    .perf_tbranch_o,
+    .perf_if_cheri_err_o,
 `endif
 
     .fetch_enable_i        (fetch_enable_buf),
@@ -386,7 +405,8 @@ module ibex_top import ibex_pkg::*; #(
       .DummyInstructions(DummyInstructions),
       // SEC_CM: DATA_REG_SW.GLITCH_DETECT
       .WrenCheck        (RegFileWrenCheck),
-      .WordZeroVal      (RegFileDataWidth'(prim_secded_pkg::SecdedInv3932ZeroWord))
+      .WordResetVal     (RegFileDataWidth'(CheriAlmightyCap)),
+      .WordZeroVal      (RegFileDataWidth'(CheriNullCap))
     ) register_file_i (
       .clk_i (clk),
       .rst_ni(rst_ni),
@@ -410,7 +430,7 @@ module ibex_top import ibex_pkg::*; #(
       .DummyInstructions(DummyInstructions),
       // SEC_CM: DATA_REG_SW.GLITCH_DETECT
       .WrenCheck        (RegFileWrenCheck),
-      .WordZeroVal      (RegFileDataWidth'(prim_secded_pkg::SecdedInv3932ZeroWord))
+      .WordZeroVal      (RegFileDataWidth'(CheriAlmightyCap))
     ) register_file_i (
       .clk_i (clk),
       .rst_ni(rst_ni),
@@ -434,7 +454,7 @@ module ibex_top import ibex_pkg::*; #(
       .DummyInstructions(DummyInstructions),
       // SEC_CM: DATA_REG_SW.GLITCH_DETECT
       .WrenCheck        (RegFileWrenCheck),
-      .WordZeroVal      (RegFileDataWidth'(prim_secded_pkg::SecdedInv3932ZeroWord))
+      .WordZeroVal      (RegFileDataWidth'(CheriAlmightyCap))
     ) register_file_i (
       .clk_i (clk),
       .rst_ni(rst_ni),
@@ -644,7 +664,7 @@ module ibex_top import ibex_pkg::*; #(
 
   end
 
-  assign data_wdata_o = data_wdata_core[31:0];
+  assign data_wdata_o = data_wdata_core[MemDataWidth-1:0];
 
   if (MemECC) begin : gen_mem_wdata_ecc
     prim_buf #(.Width(7)) u_prim_buf_data_wdata_intg (

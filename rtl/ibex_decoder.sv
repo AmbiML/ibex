@@ -80,9 +80,41 @@ module ibex_decoder #(
   output ibex_pkg::md_op_e     multdiv_operator_o,
   output logic [1:0]           multdiv_signed_mode_o,
 
+  // CHERI operation selection
+  output logic                            cheri_en_o,
+  output ibex_pkg::cheri_base_opcode_e    cheri_base_opcode_o,
+  output ibex_pkg::cheri_threeop_funct7_e cheri_threeop_opcode_o,
+  output ibex_pkg::cheri_s_a_d_funct5_e   cheri_s_a_d_opcode_o,
+  output logic                            cheri_alu_exc_only_o,
+
+  // whether we're in capability mode or not
+  input logic                             cap_mode_i,
+
+  // current privilege mode
+  input ibex_pkg::priv_lvl_e              priv_mode_i,
+
+  // whether the offset for this memory access should be relative to the
+  // capability base or the capability address
+  // for DDC-relative CHERI-added (non-RISC-V) loads and stores, we need to
+  // add in the address of DDC
+  // for non-DDC-relative accesses, the address is already factored in within
+  // the ALU
+  output logic                            add_auth_addr_o,
+
+  // CHERI operand selection & enable
+  output ibex_pkg::c_op_a_sel_e           cheri_op_a_mux_sel_o,
+  output ibex_pkg::c_op_b_sel_e           cheri_op_b_mux_sel_o,
+  output ibex_pkg::c_imm_b_sel_e          cheri_imm_b_mux_sel_o,
+  output logic                            cheri_a_en_o,
+  output logic                            cheri_b_en_o,
+
   // CSRs
   output logic                 csr_access_o,          // access to CSR
   output ibex_pkg::csr_op_e    csr_op_o,              // operation to perform on CSR
+
+  // SCRs
+  output logic                 scr_access_o,
+  output ibex_pkg::scr_op_e    scr_op_o,
 
   // LSU
   output logic                 data_req_o,            // start transaction to data memory
@@ -91,6 +123,11 @@ module ibex_decoder #(
                                                       // word or word
   output logic                 data_sign_extension_o, // sign extension for data read from
                                                       // memory
+  output logic                 mem_cap_access_o,      // whether the instruction is a
+                                                      // capability access
+
+  // tell ID stage whether the instruction requires DDC or a capability from a register
+  output logic                 mem_ddc_relative_o,
 
   // jump/branches
   output logic                 jump_in_dec_o,         // jump is being calculated in ALU
@@ -120,6 +157,16 @@ module ibex_decoder #(
 
   opcode_e     opcode;
   opcode_e     opcode_alu;
+
+  cheri_base_opcode_e    cheri_base_opcode;
+  cheri_threeop_funct7_e cheri_threeop_opcode;
+  cheri_s_a_d_funct5_e   cheri_s_a_d_opcode;
+
+  logic overwrite_rf_waddr;
+
+  assign cheri_base_opcode    = cheri_base_opcode_e'    (instr[14:12]);
+  assign cheri_threeop_opcode = cheri_threeop_funct7_e' (instr[31:25]);
+  assign cheri_s_a_d_opcode   = cheri_s_a_d_funct5_e'   (instr[24:20]);
 
   // To help timing the flops containing the current instruction are replicated to reduce fan-out.
   // instr_alu is used to determine the ALU control logic and associated operand/imm select signals
@@ -171,7 +218,8 @@ module ibex_decoder #(
 
   // destination register
   assign instr_rd = instr[11:7];
-  assign rf_waddr_o   = instr_rd; // rd
+  // CInvoke always writes to register 31
+  assign rf_waddr_o   = overwrite_rf_waddr ? 5'd31 : instr_rd; // rd
 
   ////////////////////
   // Register check //
@@ -211,10 +259,14 @@ module ibex_decoder #(
     multdiv_operator_o    = MD_OP_MULL;
     multdiv_signed_mode_o = 2'b00;
 
+    add_auth_addr_o        = 1'b0;
+    mem_ddc_relative_o     = 1'b0;
+
     rf_wdata_sel_o        = RF_WD_EX;
     rf_we                 = 1'b0;
     rf_ren_a_o            = 1'b0;
     rf_ren_b_o            = 1'b0;
+    overwrite_rf_waddr    = 1'b0;
 
     csr_access_o          = 1'b0;
     csr_illegal           = 1'b0;
@@ -224,6 +276,7 @@ module ibex_decoder #(
     data_type_o           = 2'b00;
     data_sign_extension_o = 1'b0;
     data_req_o            = 1'b0;
+    mem_cap_access_o      = 1'b0;
 
     illegal_insn          = 1'b0;
     ebrk_insn_o           = 1'b0;
@@ -243,6 +296,11 @@ module ibex_decoder #(
       OPCODE_JAL: begin   // Jump and Link
         jump_in_dec_o      = 1'b1;
 
+        if (cap_mode_i) begin
+          // this becomes a CJALR with an immediate
+          rf_wdata_sel_o = RF_WD_CHERI;
+        end
+
         if (instr_first_cycle_i) begin
           // Calculate jump target (and store PC + 4 if BranchTargetALU is configured)
           rf_we            = BranchTargetALU;
@@ -255,6 +313,11 @@ module ibex_decoder #(
 
       OPCODE_JALR: begin  // Jump and Link Register
         jump_in_dec_o      = 1'b1;
+
+        if (cap_mode_i) begin
+          // this becomes a CJALR with an immediate
+          rf_wdata_sel_o = RF_WD_CHERI;
+        end
 
         if (instr_first_cycle_i) begin
           // Calculate jump target (and store PC + 4 if BranchTargetALU is configured)
@@ -298,6 +361,9 @@ module ibex_decoder #(
         data_req_o         = 1'b1;
         data_we_o          = 1'b1;
 
+        mem_ddc_relative_o = !cap_mode_i;
+        add_auth_addr_o    = 1'b1;
+
         if (instr[14]) begin
           illegal_insn = 1'b1;
         end
@@ -307,7 +373,11 @@ module ibex_decoder #(
           2'b00:   data_type_o  = 2'b10; // sb
           2'b01:   data_type_o  = 2'b01; // sh
           2'b10:   data_type_o  = 2'b00; // sw
-          default: illegal_insn = 1'b1;
+          2'b11: begin
+            data_type_o         = 2'b11; // store cap
+            mem_cap_access_o    = 1'b1;
+            add_auth_addr_o     = 1'b1;
+          end
         endcase
       end
 
@@ -315,6 +385,9 @@ module ibex_decoder #(
         rf_ren_a_o          = 1'b1;
         data_req_o          = 1'b1;
         data_type_o         = 2'b00;
+
+        mem_ddc_relative_o  = !cap_mode_i;
+        add_auth_addr_o     = 1'b1;
 
         // sign/zero extension
         data_sign_extension_o = ~instr[14];
@@ -329,8 +402,10 @@ module ibex_decoder #(
               illegal_insn = 1'b1;    // lwu does not exist
             end
           end
-          default: begin
-            illegal_insn = 1'b1;
+          2'b11: begin
+            data_type_o      = 2'b11; // load cap
+            mem_cap_access_o = 1'b1;
+            add_auth_addr_o  = 1'b1;
           end
         endcase
       end
@@ -345,6 +420,9 @@ module ibex_decoder #(
 
       OPCODE_AUIPC: begin  // Add Upper Immediate to PC
         rf_we            = 1'b1;
+        if (cap_mode_i) begin
+          rf_wdata_sel_o = RF_WD_CHERI;
+        end
       end
 
       OPCODE_OP_IMM: begin // Register-Immediate ALU Operations
@@ -600,8 +678,9 @@ module ibex_decoder #(
               // debugger trap
               ebrk_insn_o = 1'b1;
 
-            12'h302:  // mret
-              mret_insn_o = 1'b1;
+            12'h302: begin  // mret
+              mret_insn_o       = 1'b1;
+            end
 
             12'h7b2:  // dret
               dret_insn_o = 1'b1;
@@ -638,6 +717,153 @@ module ibex_decoder #(
         end
 
       end
+
+      OPCODE_CHERI: begin
+        rf_wdata_sel_o       = RF_WD_CHERI;
+        unique case (cheri_base_opcode)
+          C_SET_BOUNDS_IMM, C_INC_OFFSET_IMM: begin
+            rf_we = 1'b1;
+          end
+          THREE_OP: begin
+            unique case (cheri_threeop_opcode)
+              C_SET_BOUNDS, C_SET_BOUNDS_EXACT, C_AND_PERM, C_SET_FLAGS, C_SET_OFFSET, C_SET_ADDR, C_INC_OFFSET: begin
+                rf_we = 1'b1;
+              end
+              C_BUILD_CAP, C_TEST_SUBSET: begin
+                rf_we = 1'b1;
+              end
+              C_SUB, C_COPY_TYPE, C_SEAL, C_C_SEAL, C_UNSEAL: begin
+                rf_we = 1'b1;
+              end
+              C_TO_PTR: begin
+                rf_we = 1'b1;
+              end
+              C_FROM_PTR: begin
+                rf_we = 1'b1;
+              end
+              C_INVOKE: begin
+                jump_in_dec_o      = 1'b1;
+                overwrite_rf_waddr = 1'b1;
+                jump_set_o         =  instr_first_cycle_i;
+                rf_we              = ~instr_first_cycle_i;
+              end
+              C_SPECIAL_RW: begin
+                rf_we = 1'b1;
+                if ((rf_raddr_b_o == SCR_PCC & rf_raddr_a_o == 0) // writing to PCC is illegal
+                   ) begin
+                end else if ((rf_raddr_b_o == SCR_DDC      )
+                            |(rf_raddr_b_o == SCR_MTCC     ) // Machine mode
+                            |(rf_raddr_b_o == SCR_MTDC     ) // Machine mode
+                            |(rf_raddr_b_o == SCR_MSCRATCHC) // Machine mode
+                            |(rf_raddr_b_o == SCR_MEPCC    ) // Machine mode
+                            //|(rf_raddr_b_o == SCR_STCC                   ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_STDC                   ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_SSCRATCHC              ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_SEPCC                  ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_UTCC                   ) // User mode
+                            //|(rf_raddr_b_o == SCR_UTDC                   ) // User mode
+                            //|(rf_raddr_b_o == SCR_USCRATCHC              ) // User mode
+                            //|(rf_raddr_b_o == SCR_UEPCC                  ) // User mode
+                            ) begin
+                  // nothing to do, but not illegal instruction
+                  rf_wdata_sel_o        = RF_WD_CSR;
+                end else begin
+                  illegal_insn = 1'b1;
+                end
+              end
+              C_STORE: begin
+                rf_ren_a_o         = 1'b1;
+                rf_ren_b_o         = 1'b1;
+                data_req_o         = 1'b1;
+                data_we_o          = 1'b1;
+
+                mem_ddc_relative_o = ~instr[10];
+                add_auth_addr_o    = ~instr[10];
+                // instr[11] should always be 0
+                // instr[9] indicates store quad - not allowed in RV32
+                if (instr[11] || instr[9]) begin
+                  illegal_insn = 1'b1;
+                end
+
+                // store size
+                unique case (instr[8:7])
+                  2'b00:   data_type_o  = 2'b10; // sb
+                  2'b01:   data_type_o  = 2'b01; // sh
+                  2'b10:   data_type_o  = 2'b00; // sw
+                  2'b11: begin // store double via cap not allowed in RV32
+                    data_type_o      = 2'b11;
+                    mem_cap_access_o = 1'b1;
+                  end
+                endcase
+              end
+              C_LOAD: begin
+                rf_ren_a_o          = 1'b1;
+                data_req_o          = 1'b1;
+                data_type_o         = 2'b00;
+
+                mem_ddc_relative_o  = ~instr[23];
+                add_auth_addr_o     = ~instr[23];
+
+                // sign/zero extension
+                data_sign_extension_o = ~instr[22];
+
+                // load size
+                unique case (instr[21:20])
+                  2'b00: data_type_o = 2'b10; // lb(u)
+                  2'b01: data_type_o = 2'b01; // lh(u)
+                  2'b10: begin
+                    data_type_o = 2'b00;      // lw
+                    if (instr[22]) begin
+                      illegal_insn = 1'b1;    // lwu does not exist
+                    end
+                  end
+                  2'b11: begin
+                    data_type_o      = 2'b11; // load double
+                    mem_cap_access_o = 1'b1;
+                    if (instr[22]) begin
+                      illegal_insn = 1'b1; // ldu does not exist
+                    end
+                  end
+                endcase
+
+                // quad-sized accesses are illegal
+                if (instr[24] == 1'b1) begin
+                  illegal_insn = 1'b1;
+                end
+              end
+              SOURCE_AND_DEST: begin
+                rf_we = 1'b1;
+                unique case (cheri_s_a_d_opcode)
+                  C_JALR: begin
+                    jump_in_dec_o = 1'b1;
+                    // first cycle does not write
+                    if (instr_first_cycle_i) begin
+                      rf_we = 1'b0;
+                      jump_set_o = 1'b1;
+                    end
+                  end
+                  C_GET_PERM, C_GET_TYPE, C_GET_BASE, C_GET_LEN, C_GET_TAG, C_GET_SEALED, C_GET_OFFSET,
+                  C_GET_ADDR, C_GET_FLAGS, C_MOVE, C_CLEAR_TAG, CLEAR, C_SEAL_ENTRY, C_ROUND_REP_LEN,
+                  C_REP_ALIGN_MASK: begin
+                    // nothing to do here, but need to match so that they are
+                    // not flagged as illegal
+                  end
+                  default: begin
+                    illegal_insn = 1'b1;
+                  end
+                endcase
+              end
+              default: begin
+                illegal_insn = 1'b1;
+              end
+            endcase
+          end
+          default: begin
+            illegal_insn = 1'b1;
+          end
+        endcase
+      end
+
       default: begin
         illegal_insn = 1'b1;
       end
@@ -682,10 +908,24 @@ module ibex_decoder #(
 
     opcode_alu         = opcode_e'(instr_alu[6:0]);
 
+    cheri_a_en_o           = 1'b0;
+    cheri_b_en_o           = 1'b0;
+    cheri_op_a_mux_sel_o   = CHERI_OP_A_REG_CAP;
+    cheri_op_b_mux_sel_o   = CHERI_OP_B_REG_CAP;
+    cheri_imm_b_mux_sel_o  = CHERI_IMM_B_I;
+    cheri_base_opcode_o    = cheri_base_opcode;
+    cheri_threeop_opcode_o = cheri_threeop_opcode;
+    cheri_s_a_d_opcode_o   = cheri_s_a_d_opcode;
+    cheri_alu_exc_only_o   = 1'b0;
+
+    scr_access_o          = 1'b0;
+    scr_op_o              = SCR_NONE;
+
     use_rs3_d          = 1'b0;
     alu_multicycle_o   = 1'b0;
     mult_sel_o         = 1'b0;
     div_sel_o          = 1'b0;
+    cheri_en_o         = 1'b0;
 
     unique case (opcode_alu)
 
@@ -699,6 +939,30 @@ module ibex_decoder #(
           bt_b_mux_sel_o = IMM_B_J;
         end
 
+        if (cap_mode_i) begin
+          // this becomes a CJALR with an immediate
+          cheri_en_o = 1'b1;
+          cheri_base_opcode_o = THREE_OP;
+          cheri_threeop_opcode_o = SOURCE_AND_DEST;
+          cheri_s_a_d_opcode_o = C_JALR;
+
+          // no attempt at BTALU compatibility here
+          if (instr_first_cycle_i) begin
+            cheri_op_a_mux_sel_o = CHERI_OP_A_PCC;
+            cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+            cheri_imm_b_mux_sel_o = CHERI_IMM_B_J;
+          end else begin
+            cheri_op_a_mux_sel_o = CHERI_OP_A_PCC;
+            cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+            cheri_imm_b_mux_sel_o = CHERI_IMM_B_INCR_PC;
+          end
+        end else begin
+          // to check for exceptions
+          cheri_op_a_mux_sel_o = CHERI_OP_A_PCC;
+          cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+          cheri_imm_b_mux_sel_o = CHERI_IMM_B_TWO;
+        end
+
         // Jumps take two cycles without the BTALU
         if (instr_first_cycle_i && !BranchTargetALU) begin
           // Calculate jump target
@@ -706,12 +970,18 @@ module ibex_decoder #(
           alu_op_b_mux_sel_o  = OP_B_IMM;
           imm_b_mux_sel_o     = IMM_B_J;
           alu_operator_o      = ALU_ADD;
+          // to check for exceptions
+          cheri_alu_exc_only_o = ~cap_mode_i;
         end else begin
           // Calculate and store PC+4
           alu_op_a_mux_sel_o  = OP_A_CURRPC;
           alu_op_b_mux_sel_o  = OP_B_IMM;
           imm_b_mux_sel_o     = IMM_B_INCR_PC;
           alu_operator_o      = ALU_ADD;
+          // to check for exceptions, only if there is a branch target ALU
+          // (otherwise the check would have already been performed in the
+          // first cycle)
+          cheri_alu_exc_only_o = ~cap_mode_i & BranchTargetALU;
         end
       end
 
@@ -721,6 +991,30 @@ module ibex_decoder #(
           bt_b_mux_sel_o = IMM_B_I;
         end
 
+        if (cap_mode_i) begin
+          // this becomes a CJALR with an immediate
+          cheri_en_o = 1'b1;
+          cheri_base_opcode_o = THREE_OP;
+          cheri_threeop_opcode_o = SOURCE_AND_DEST;
+          cheri_s_a_d_opcode_o = C_JALR;
+
+          // no attempt at BTALU compatibility here
+          if (instr_first_cycle_i) begin
+            cheri_op_a_mux_sel_o = CHERI_OP_A_REG_CAP;
+            cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+            cheri_imm_b_mux_sel_o = CHERI_IMM_B_I;
+          end else begin
+            cheri_op_a_mux_sel_o = CHERI_OP_A_PCC;
+            cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+            cheri_imm_b_mux_sel_o = CHERI_IMM_B_INCR_PC;
+          end
+        end else begin
+          // to check for exceptions
+          cheri_op_a_mux_sel_o = CHERI_OP_A_PCC;
+          cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+          cheri_imm_b_mux_sel_o = CHERI_IMM_B_TWO;
+        end
+
         // Jumps take two cycles without the BTALU
         if (instr_first_cycle_i && !BranchTargetALU) begin
           // Calculate jump target
@@ -728,12 +1022,16 @@ module ibex_decoder #(
           alu_op_b_mux_sel_o  = OP_B_IMM;
           imm_b_mux_sel_o     = IMM_B_I;
           alu_operator_o      = ALU_ADD;
+          // to check for exceptions
+          cheri_alu_exc_only_o = ~cap_mode_i;
         end else begin
           // Calculate and store PC+4
           alu_op_a_mux_sel_o  = OP_A_CURRPC;
           alu_op_b_mux_sel_o  = OP_B_IMM;
           imm_b_mux_sel_o     = IMM_B_INCR_PC;
           alu_operator_o      = ALU_ADD;
+          // to check for exceptions when there is a BTALU
+          cheri_alu_exc_only_o = ~cap_mode_i & BranchTargetALU;
         end
       end
 
@@ -749,6 +1047,9 @@ module ibex_decoder #(
           default: ;
         endcase
 
+        // to check for exceptions
+        cheri_op_a_mux_sel_o = CHERI_OP_A_PCC;
+
         if (BranchTargetALU) begin
           bt_a_mux_sel_o = OP_A_CURRPC;
           // Not-taken branch will jump to next instruction (used in secure mode)
@@ -761,6 +1062,9 @@ module ibex_decoder #(
           // First evaluate the branch condition
           alu_op_a_mux_sel_o  = OP_A_REG_A;
           alu_op_b_mux_sel_o  = OP_B_REG_B;
+          // to check for exceptions
+          // branch target is only available in the first cycle with BTALU enabled
+          cheri_alu_exc_only_o = BranchTargetALU;
         end else if (!BranchTargetALU) begin
           // Then calculate jump target
           alu_op_a_mux_sel_o  = OP_A_CURRPC;
@@ -768,6 +1072,8 @@ module ibex_decoder #(
           // Not-taken branch will jump to next instruction (used in secure mode)
           imm_b_mux_sel_o     = branch_taken_i ? IMM_B_B : IMM_B_INCR_PC;
           alu_operator_o      = ALU_ADD;
+          // to check for exceptions when BTALU is disabled
+          cheri_alu_exc_only_o = 1'b1;
         end
       end
 
@@ -776,7 +1082,7 @@ module ibex_decoder #(
       ////////////////
 
       OPCODE_STORE: begin
-        alu_op_a_mux_sel_o = OP_A_REG_A;
+        alu_op_a_mux_sel_o = cap_mode_i ? OP_A_IMM : OP_A_REG_A;
         alu_op_b_mux_sel_o = OP_B_REG_B;
         alu_operator_o     = ALU_ADD;
 
@@ -788,7 +1094,7 @@ module ibex_decoder #(
       end
 
       OPCODE_LOAD: begin
-        alu_op_a_mux_sel_o  = OP_A_REG_A;
+        alu_op_a_mux_sel_o  = cap_mode_i ? OP_A_IMM : OP_A_REG_A;
 
         // offset from immediate
         alu_operator_o      = ALU_ADD;
@@ -809,10 +1115,18 @@ module ibex_decoder #(
       end
 
       OPCODE_AUIPC: begin  // Add Upper Immediate to PC
-        alu_op_a_mux_sel_o  = OP_A_CURRPC;
-        alu_op_b_mux_sel_o  = OP_B_IMM;
-        imm_b_mux_sel_o     = IMM_B_U;
-        alu_operator_o      = ALU_ADD;
+        if (!cap_mode_i) begin
+          alu_op_a_mux_sel_o  = OP_A_CURRPC;
+          alu_op_b_mux_sel_o  = OP_B_IMM;
+          imm_b_mux_sel_o     = IMM_B_U;
+          alu_operator_o      = ALU_ADD;
+        end else begin
+          cheri_en_o            = 1'b1;
+          cheri_base_opcode_o   = C_INC_OFFSET_IMM;
+          cheri_op_a_mux_sel_o  = CHERI_OP_A_PCC;
+          cheri_op_b_mux_sel_o  = CHERI_OP_B_IMM;
+          cheri_imm_b_mux_sel_o = CHERI_IMM_B_U;
+        end
       end
 
       OPCODE_OP_IMM: begin // Register-Immediate ALU Operations
@@ -1181,6 +1495,133 @@ module ibex_decoder #(
         end
 
       end
+
+      OPCODE_CHERI: begin
+        cheri_en_o           = 1'b1;
+        cheri_a_en_o         = 1'b1;
+        cheri_op_a_mux_sel_o = CHERI_OP_A_REG_CAP;
+
+        unique case (cheri_base_opcode)
+          C_SET_BOUNDS_IMM, C_INC_OFFSET_IMM: begin
+            cheri_op_b_mux_sel_o  = CHERI_OP_B_IMM;
+            cheri_imm_b_mux_sel_o = CHERI_IMM_B_I;
+          end
+
+          THREE_OP: begin
+            unique case (cheri_threeop_opcode)
+              C_SET_BOUNDS, C_SET_BOUNDS_EXACT, C_AND_PERM, C_SET_FLAGS, C_SET_OFFSET, C_SET_ADDR, C_INC_OFFSET: begin
+                cheri_op_b_mux_sel_o = CHERI_OP_B_REG_CAP;
+                cheri_b_en_o         = 1'b1;
+              end
+
+              C_BUILD_CAP, C_TEST_SUBSET: begin
+                cheri_op_a_mux_sel_o = CHERI_OP_A_REG_DDC;
+                cheri_op_b_mux_sel_o = CHERI_OP_B_REG_CAP;
+                cheri_b_en_o         = 1'b1;
+              end
+
+              C_SUB, C_COPY_TYPE, C_SEAL, C_C_SEAL, C_UNSEAL: begin
+                cheri_op_b_mux_sel_o = CHERI_OP_B_REG_CAP;
+                cheri_b_en_o         = 1'b1;
+              end
+
+              C_TO_PTR: begin
+                cheri_op_b_mux_sel_o = CHERI_OP_B_REG_DDC;
+                cheri_b_en_o         = 1'b1;
+              end
+
+              C_FROM_PTR: begin
+                cheri_op_a_mux_sel_o = CHERI_OP_A_REG_DDC;
+                cheri_op_b_mux_sel_o = CHERI_OP_B_REG_CAP;
+                cheri_b_en_o         = 1'b1;
+              end
+
+              C_INVOKE: begin
+                cheri_op_a_mux_sel_o = CHERI_OP_A_REG_CAP;
+                cheri_op_b_mux_sel_o = CHERI_OP_B_REG_CAP;
+              end
+
+              C_SPECIAL_RW: begin
+                if (rf_raddr_b_o == SCR_PCC & rf_raddr_a_o == 0) begin
+                  // simple instruction; just read PCC
+                  cheri_op_a_mux_sel_o   = CHERI_OP_A_PCC;
+                  cheri_base_opcode_o    = THREE_OP;
+                  cheri_threeop_opcode_o = SOURCE_AND_DEST;
+                  cheri_s_a_d_opcode_o   = C_MOVE;
+                end else if ((rf_raddr_b_o == SCR_DDC                    ) // DDC read+write
+                            |(rf_raddr_b_o == SCR_MTCC                   ) // Machine mode
+                            |(rf_raddr_b_o == SCR_MTDC                   ) // Machine mode
+                            |(rf_raddr_b_o == SCR_MSCRATCHC              ) // Machine mode
+                            |(rf_raddr_b_o == SCR_MEPCC                  ) // Machine mode
+                            //|(rf_raddr_b_o == SCR_STCC                   ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_STDC                   ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_SSCRATCHC              ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_SEPCC                  ) // Supervisor mode
+                            //|(rf_raddr_b_o == SCR_UTCC                   ) // User mode
+                            //|(rf_raddr_b_o == SCR_UTDC                   ) // User mode
+                            //|(rf_raddr_b_o == SCR_USCRATCHC              ) // User mode
+                            //|(rf_raddr_b_o == SCR_UEPCC                  ) // User mode
+                            ) begin
+                  scr_access_o          = 1'b1;
+                  scr_op_o              = scr_op_e'({rf_waddr_o != '0, rf_raddr_a_o != '0});
+                  cheri_en_o            = 1'b1;
+                  cheri_op_b_mux_sel_o  = CHERI_OP_B_IMM;
+                  cheri_imm_b_mux_sel_o = CHERI_IMM_B_RS2;
+                end
+              end
+              C_STORE: begin
+                // these stores don't use the CHERI ALU, but do need to use
+                // the integer ALU to compute addresses
+                cheri_en_o         = 1'b0;
+                alu_op_a_mux_sel_o = OP_A_REG_A;
+                alu_op_b_mux_sel_o = OP_B_IMM;
+                imm_b_mux_sel_o    = IMM_B_ZERO;
+                alu_operator_o     = ALU_ADD;
+              end
+
+              C_LOAD: begin
+                // these loads don't use the CHERI ALU, but do need to use
+                // the integer ALU to compute addresses
+                cheri_en_o         = 1'b0;
+                alu_op_a_mux_sel_o = OP_A_REG_A;
+                alu_op_b_mux_sel_o = OP_B_IMM;
+                imm_b_mux_sel_o    = IMM_B_ZERO;
+                alu_operator_o     = ALU_ADD;
+              end
+
+              SOURCE_AND_DEST: begin
+                unique case (cheri_s_a_d_opcode)
+                  C_JALR: begin
+                    if (instr_first_cycle_i) begin
+                      // Calculate jump target
+                      // there is nothing to actually calculate but we need to
+                      // perform exception checks
+                      cheri_op_a_mux_sel_o = CHERI_OP_A_REG_CAP;
+                      cheri_op_b_mux_sel_o = CHERI_OP_B_IMM;
+                      cheri_imm_b_mux_sel_o = CHERI_IMM_B_ZERO;
+                    end else begin
+                      // Calculate and store PCC+4
+                      cheri_op_a_mux_sel_o  = CHERI_OP_A_PCC;
+                      cheri_op_b_mux_sel_o  = CHERI_OP_B_IMM;
+                      cheri_imm_b_mux_sel_o = CHERI_IMM_B_INCR_PC;
+                    end
+                  end
+                  C_GET_PERM, C_GET_TYPE, C_GET_BASE, C_GET_LEN, C_GET_TAG, C_GET_SEALED, C_GET_OFFSET,
+                  C_GET_ADDR, C_GET_FLAGS, C_MOVE, C_CLEAR_TAG, CLEAR, C_SEAL_ENTRY,
+                  C_ROUND_REP_LEN, C_REP_ALIGN_MASK: begin
+                    // nothing to do here; values have already been set before
+                  end
+                  default: ;
+                endcase
+              end
+              default: ;
+            endcase
+          end
+
+          default: ;
+        endcase
+      end
+
       default: ;
     endcase
   end

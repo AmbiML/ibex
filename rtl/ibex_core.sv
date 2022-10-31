@@ -37,12 +37,16 @@ module ibex_core import ibex_pkg::*; #(
   parameter lfsr_perm_t  RndCnstLfsrPerm   = RndCnstLfsrPermDefault,
   parameter bit          SecureIbex        = 1'b0,
   parameter bit          DummyInstructions = 1'b0,
+  parameter int unsigned CheriCapWidth     = 91,
+  parameter bit [CheriCapWidth-1:0] CheriAlmightyCap  = 91'h0,
+  parameter bit [CheriCapWidth-1:0] CheriNullCap      = 91'h0,
   parameter bit          RegFileECC        = 1'b0,
   parameter int unsigned RegFileDataWidth  = 32,
   parameter bit          MemECC            = 1'b0,
-  parameter int unsigned MemDataWidth      = MemECC ? 32 + 7 : 32,
+  parameter int unsigned MemDataWidth      = MemECC ? 32 + 7 : 33,
   parameter int unsigned DmHaltAddr        = 32'h1A110800,
-  parameter int unsigned DmExceptionAddr   = 32'h1A110808
+  parameter int unsigned DmExceptionAddr   = 32'h1A110808,
+  parameter int          TestRIG           = 0
 ) (
   // Clock and Reset
   input  logic                         clk_i,
@@ -131,14 +135,18 @@ module ibex_core import ibex_pkg::*; #(
   output logic [31:0]                  rvfi_pc_rdata,
   output logic [31:0]                  rvfi_pc_wdata,
   output logic [31:0]                  rvfi_mem_addr,
-  output logic [ 3:0]                  rvfi_mem_rmask,
-  output logic [ 3:0]                  rvfi_mem_wmask,
-  output logic [31:0]                  rvfi_mem_rdata,
-  output logic [31:0]                  rvfi_mem_wdata,
+  output logic [ 7:0]                  rvfi_mem_rmask,
+  output logic [ 7:0]                  rvfi_mem_wmask,
+  output logic [63:0]                  rvfi_mem_rdata,
+  output logic [63:0]                  rvfi_mem_wdata,
   output logic [31:0]                  rvfi_ext_mip,
   output logic                         rvfi_ext_nmi,
   output logic                         rvfi_ext_debug_req,
   output logic [63:0]                  rvfi_ext_mcycle,
+  output logic                         perf_xret_o,
+  output logic                         perf_jump_o,
+  output logic                         perf_tbranch_o,
+  output logic                         perf_if_cheri_err_o,
 `endif
 
   // CPU Control Signals
@@ -170,10 +178,15 @@ module ibex_core import ibex_pkg::*; #(
   logic        instr_bp_taken_id;
   logic        instr_fetch_err;                // Bus error on instr fetch
   logic        instr_fetch_err_plus2;          // Instruction error is misaligned
+  logic        instr_cheri_err;                // Instruction error is CHERI error
   logic        illegal_c_insn_id;              // Illegal compressed instruction sent to ID stage
+  logic [CheriCapWidth-1:0] instr_fetch_auth;  // The authority allowing the current instruction request
   logic [31:0] pc_if;                          // Program counter in IF stage
+  logic [CheriCapWidth-1:0] pcc_if;            // Program counter capability in IF stage
   logic [31:0] pc_id;                          // Program counter in ID stage
+  logic [CheriCapWidth-1:0] pcc_id;            // Program counter capability in ID stage
   logic [31:0] pc_wb;                          // Program counter in WB stage
+  logic [CheriCapWidth-1:0] pcc_wb;            // Program counter capability in WB stage
   logic [33:0] imd_val_d_ex[2];                // Intermediate register for multicycle Ops
   logic [33:0] imd_val_q_ex[2];                // Intermediate register for multicycle Ops
   logic [1:0]  imd_val_we_ex;
@@ -202,14 +215,19 @@ module ibex_core import ibex_pkg::*; #(
   logic        lsu_load_err;
   logic        lsu_store_err;
   logic        lsu_load_intg_err;
+  logic        lsu_load_misalign_err;
+  logic        lsu_store_misalign_err;
+  logic        lsu_cheri_err;
 
   // LSU signals
   logic        lsu_addr_incr_req;
   logic [31:0] lsu_addr_last;
 
   // Jump and branch target and decision (EX->IF)
-  logic [31:0] branch_target_ex;
-  logic        branch_decision;
+  logic [31:0]              branch_target_int_ex;
+  logic                     branch_decision;
+  logic                     branch_is_cap;
+  logic [31:0]              if_pc_set_target;
 
   // Core busy signals
   logic        ctrl_busy;
@@ -217,27 +235,37 @@ module ibex_core import ibex_pkg::*; #(
   logic        lsu_busy;
 
   // Register File
-  logic [4:0]  rf_raddr_a;
-  logic [31:0] rf_rdata_a;
-  logic [4:0]  rf_raddr_b;
-  logic [31:0] rf_rdata_b;
-  logic        rf_ren_a;
-  logic        rf_ren_b;
-  logic [4:0]  rf_waddr_wb;
-  logic [31:0] rf_wdata_wb;
+  logic [4:0]               rf_raddr_a;
+  logic [CheriCapWidth-1:0] rf_rdata_a_cap;
+  logic [31:0]              rf_rdata_a_int;
+  logic [4:0]               rf_raddr_b;
+  logic [CheriCapWidth-1:0] rf_rdata_b_cap;
+  logic [31:0]              rf_rdata_b_int;
+  logic                     rf_ren_a;
+  logic                     rf_ren_b;
+  logic [4:0]               rf_waddr_wb;
+  logic [CheriCapWidth-1:0] rf_wdata_cap_wb;
+  logic [31:0]              rf_wdata_int_wb;
   // Writeback register write data that can be used on the forwarding path (doesn't factor in memory
   // read data as this is too late for the forwarding path)
-  logic [31:0] rf_wdata_fwd_wb;
-  logic [31:0] rf_wdata_lsu;
-  logic        rf_we_wb;
-  logic        rf_we_lsu;
-  logic        rf_ecc_err_comb;
+  logic [CheriCapWidth-1:0] rf_wdata_cap_fwd_wb;
+  logic [31:0]              rf_wdata_int_fwd_wb;
+  logic                     rf_wcap_fwd_wb;
+  logic [CheriCapWidth-1:0] rf_wdata_cap_lsu;
+  logic [31:0]              rf_wdata_int_lsu;
+  logic                     rf_wcap_lsu;
+  logic                     rf_we_wb;
+  logic                     rf_wcap_wb;
+  logic                     rf_we_lsu;
+  logic                     rf_ecc_err_comb;
 
-  logic [4:0]  rf_waddr_id;
-  logic [31:0] rf_wdata_id;
-  logic        rf_we_id;
-  logic        rf_rd_a_wb_match;
-  logic        rf_rd_b_wb_match;
+  logic [4:0]               rf_waddr_id;
+  logic [CheriCapWidth-1:0] rf_wdata_cap_id;
+  logic [31:0]              rf_wdata_int_id;
+  logic                     rf_we_id;
+  logic                     rf_wcap_id;
+  logic                     rf_rd_a_wb_match;
+  logic                     rf_rd_b_wb_match;
 
   // ALU Control
   alu_op_e     alu_operator_ex;
@@ -261,6 +289,32 @@ module ibex_core import ibex_pkg::*; #(
   logic [31:0] multdiv_operand_b_ex;
   logic        multdiv_ready_id;
 
+  // CHERI opcodes
+  logic                  cheri_en;
+  cheri_base_opcode_e    cheri_base_opcode;
+  cheri_threeop_funct7_e cheri_threeop_opcode;
+  cheri_s_a_d_funct5_e   cheri_s_a_d_opcode;
+  logic                  cheri_alu_exc_only;
+
+  // CHERI operands
+  logic [CheriCapWidth-1:0] cheri_operand_a_ex;
+  logic [CheriCapWidth-1:0] cheri_operand_b_ex;
+
+  // CHERI result
+  logic [CheriCapWidth-1:0] cheri_result_ex;
+  logic                     cheri_wrote_cap_ex;
+
+  // CHERI exceptions
+  cheri_exc_t cheri_exceptions_a_ex;
+  cheri_exc_t cheri_exceptions_b_ex;
+  cheri_exc_t cheri_exceptions_lsu, cheri_exceptions_lsu_to_ctrl;
+  cheri_exc_t cheri_exceptions_instr;
+  cheri_exc_t cheri_exceptions_if; // IFetch exceptions to ID
+  logic                     instr_upper_exc, instr_upper_exc_2;
+
+  c_exc_cause_e       cheri_exc_cause;
+  c_exc_reg_mux_sel_e cheri_exc_reg_sel;
+
   // CSR control
   logic        csr_access;
   csr_op_e     csr_op;
@@ -271,14 +325,34 @@ module ibex_core import ibex_pkg::*; #(
   logic        illegal_csr_insn_id;    // CSR access to non-existent register,
                                        // with wrong priviledge level,
                                        // or missing write permissions
+  logic        csr_no_asr_id;
+
+  // SCR control;
+  logic                     scr_access;
+  scr_op_e                  scr_op;
+  logic                     scr_op_en;
+  scr_num_e                 scr_addr;
+  logic [CheriCapWidth-1:0] scr_rdata;
+  logic [CheriCapWidth-1:0] scr_wdata;
+  logic                     illegal_scr_insn_id;
+  logic                     scr_no_asr_id;
+
+  // SCRs
+  logic [CheriCapWidth-1:0] scr_ddc;
 
   // Data Memory Control
-  logic        lsu_we;
-  logic [1:0]  lsu_type;
-  logic        lsu_sign_ext;
-  logic        lsu_req;
-  logic [31:0] lsu_wdata;
-  logic        lsu_req_done;
+  logic                     lsu_we;
+  logic [1:0]               lsu_type;
+  logic                     lsu_sign_ext;
+  logic                     lsu_req;
+  logic [31:0]              lsu_wdata_int;
+  logic [CheriCapWidth-1:0] lsu_wdata_cap;
+  logic                     lsu_wcap;
+  logic                     lsu_req_done;
+  logic [CheriCapWidth-1:0] lsu_mem_auth_cap;
+  logic [31:0]              lsu_auth_addr;
+  logic                     lsu_add_auth_addr;
+  logic                     lsu_data_first_access;
 
   // stall control
   logic        id_in_ready;
@@ -304,6 +378,7 @@ module ibex_core import ibex_pkg::*; #(
   irqs_t       irqs;
   logic        csr_mstatus_mie;
   logic [31:0] csr_mepc, csr_depc;
+  logic [CheriCapWidth-1:0] scr_mepcc;
 
   // PMP signals
   logic [33:0]  csr_pmp_addr [PMPNumRegions];
@@ -324,6 +399,7 @@ module ibex_core import ibex_pkg::*; #(
   logic        csr_mstatus_tw;
   priv_lvl_e   priv_mode_id;
   priv_lvl_e   priv_mode_lsu;
+  logic [CheriCapWidth-1:0] scr_mtcc;
 
   // debug mode and dcsr configuration
   logic        debug_mode;
@@ -347,6 +423,7 @@ module ibex_core import ibex_pkg::*; #(
   logic        perf_dside_wait;
   logic        perf_mul_wait;
   logic        perf_div_wait;
+  logic        perf_xret;
   logic        perf_jump;
   logic        perf_branch;
   logic        perf_tbranch;
@@ -383,7 +460,11 @@ module ibex_core import ibex_pkg::*; #(
     .RndCnstLfsrPerm  (RndCnstLfsrPerm),
     .BranchPredictor  (BranchPredictor),
     .MemECC           (MemECC),
-    .MemDataWidth     (MemDataWidth)
+    .MemDataWidth     (MemDataWidth),
+    .CheriCapWidth    (CheriCapWidth),
+    .CheriAlmightyCap (CheriAlmightyCap),
+    .CheriNullCap     (CheriNullCap),
+    .TestRIG          (TestRIG)
   ) if_stage_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
@@ -399,6 +480,10 @@ module ibex_core import ibex_pkg::*; #(
     .instr_rdata_i     (instr_rdata_i),
     .instr_bus_err_i   (instr_err_i),
     .instr_intg_err_o  (instr_intg_err),
+
+    .instr_cheri_exc_i (cheri_exceptions_instr),
+    .instr_upper_exc_i (instr_upper_exc),
+    .instr_upper_exc_2_i(instr_upper_exc_2),
 
     .ic_tag_req_o      (ic_tag_req_o),
     .ic_tag_write_o    (ic_tag_write_o),
@@ -422,12 +507,22 @@ module ibex_core import ibex_pkg::*; #(
     .instr_bp_taken_o        (instr_bp_taken_id),
     .instr_fetch_err_o       (instr_fetch_err),
     .instr_fetch_err_plus2_o (instr_fetch_err_plus2),
+    .instr_cheri_err_o       (instr_cheri_err),
     .illegal_c_insn_id_o     (illegal_c_insn_id),
     .dummy_instr_id_o        (dummy_instr_id),
+    .instr_fetch_auth_o      (instr_fetch_auth),
     .pc_if_o                 (pc_if),
+    .pcc_if_o                (pcc_if),
     .pc_id_o                 (pc_id),
+    .pcc_id_o                (pcc_id),
     .pmp_err_if_i            (pmp_req_err[PMP_I]),
     .pmp_err_if_plus2_i      (pmp_req_err[PMP_I2]),
+
+`ifdef RVFI
+    .perf_if_cheri_err_o     (perf_if_cheri_err_o),
+`endif
+
+    .instr_cheri_exc_o       (cheri_exceptions_if),
 
     // control signals
     .instr_valid_clear_i   (instr_valid_clear),
@@ -436,6 +531,7 @@ module ibex_core import ibex_pkg::*; #(
     .nt_branch_mispredict_i(nt_branch_mispredict),
     .exc_pc_mux_i          (exc_pc_mux_id),
     .exc_cause             (exc_cause),
+    .branch_is_cap_i       (branch_is_cap),
     .dummy_instr_en_i      (dummy_instr_en),
     .dummy_instr_mask_i    (dummy_instr_mask),
     .dummy_instr_seed_en_i (dummy_instr_seed_en),
@@ -445,13 +541,17 @@ module ibex_core import ibex_pkg::*; #(
     .icache_ecc_error_o    (icache_ecc_error),
 
     // branch targets
-    .branch_target_ex_i(branch_target_ex),
-    .nt_branch_addr_i  (nt_branch_addr),
+    .branch_target_cap_ex_i(cheri_operand_a_ex), // directly from ID stage
+    .branch_target_int_ex_i(branch_target_int_ex),
+    .pc_set_target_o       (if_pc_set_target),
+    .nt_branch_addr_i      (nt_branch_addr),
 
     // CSRs
     .csr_mepc_i      (csr_mepc),  // exception return address
+    .scr_mepcc_i     (scr_mepcc), // exception return PCC
     .csr_depc_i      (csr_depc),  // debug return address
     .csr_mtvec_i     (csr_mtvec),  // trap-vector base address
+    .scr_mtcc_i      (scr_mtcc),  // exception PCC
     .csr_mtvec_init_o(csr_mtvec_init),
 
     // pipeline stalls
@@ -498,7 +598,8 @@ module ibex_core import ibex_pkg::*; #(
     .DataIndTiming  (DataIndTiming),
     .WritebackStage (WritebackStage),
     .BranchPredictor(BranchPredictor),
-    .MemECC         (MemECC)
+    .MemECC         (MemECC),
+    .CheriCapWidth  (CheriCapWidth)
   ) id_stage_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
@@ -533,9 +634,11 @@ module ibex_core import ibex_pkg::*; #(
 
     .instr_fetch_err_i      (instr_fetch_err),
     .instr_fetch_err_plus2_i(instr_fetch_err_plus2),
+    .instr_cheri_err_i      (instr_cheri_err),
     .illegal_c_insn_i       (illegal_c_insn_id),
 
-    .pc_id_i(pc_id),
+    .pc_id_i (pc_id),
+    .pcc_id_i(pcc_id),
 
     // Stalls
     .ex_valid_i      (ex_valid),
@@ -562,6 +665,31 @@ module ibex_core import ibex_pkg::*; #(
     .multdiv_operand_b_ex_o  (multdiv_operand_b_ex),
     .multdiv_ready_id_o      (multdiv_ready_id),
 
+    // CHERI operation selection
+    .cheri_en_o              (cheri_en),
+    .cheri_base_opcode_o     (cheri_base_opcode),
+    .cheri_threeop_opcode_o  (cheri_threeop_opcode),
+    .cheri_s_a_d_opcode_o    (cheri_s_a_d_opcode),
+    .cheri_alu_exc_only_o    (cheri_alu_exc_only),
+
+    // CHERI operands
+    .cheri_operand_a_o       (cheri_operand_a_ex),
+    .cheri_operand_b_o       (cheri_operand_b_ex),
+
+    // CHERI results
+    .cheri_result_ex_i       (cheri_result_ex),
+    .cheri_wrote_cap_i       (cheri_wrote_cap_ex),
+    .scr_rdata_i             (scr_rdata),
+
+    // CHERI exceptions
+    .cheri_exceptions_a_ex_i (cheri_exceptions_a_ex),
+    .cheri_exceptions_b_ex_i (cheri_exceptions_b_ex),
+    .cheri_exceptions_lsu_i  (cheri_exceptions_lsu_to_ctrl),
+    .cheri_exceptions_if_i   (cheri_exceptions_if),
+
+    .cheri_exc_cause_o       (cheri_exc_cause),
+    .cheri_exc_reg_sel_o     (cheri_exc_reg_sel),
+
     // CSR ID/EX
     .csr_access_o         (csr_access),
     .csr_op_o             (csr_op),
@@ -577,14 +705,30 @@ module ibex_core import ibex_pkg::*; #(
     .csr_mstatus_tw_i     (csr_mstatus_tw),
     .illegal_csr_insn_i   (illegal_csr_insn_id),
     .data_ind_timing_i    (data_ind_timing),
+    .csr_no_asr_i         (csr_no_asr_id),
+
+    // SCR
+    .scr_access_o         (scr_access),
+    .scr_op_en_o          (scr_op_en),
+    .scr_op_o             (scr_op),
+    .illegal_scr_insn_i   (illegal_scr_insn_id),
+    .scr_no_asr_i         (scr_no_asr_id),
+
+    // SCR values
+    .scr_ddc_i            (scr_ddc),
 
     // LSU
-    .lsu_req_o     (lsu_req),  // to load store unit
-    .lsu_we_o      (lsu_we),  // to load store unit
-    .lsu_type_o    (lsu_type),  // to load store unit
-    .lsu_sign_ext_o(lsu_sign_ext),  // to load store unit
-    .lsu_wdata_o   (lsu_wdata),  // to load store unit
-    .lsu_req_done_i(lsu_req_done),  // from load store unit
+    .lsu_req_o      (lsu_req),  // to load store unit
+    .lsu_we_o       (lsu_we),  // to load store unit
+    .lsu_type_o     (lsu_type),  // to load store unit
+    .lsu_sign_ext_o (lsu_sign_ext),  // to load store unit
+    .lsu_wdata_int_o(lsu_wdata_int),  // to load store unit
+    .lsu_wdata_cap_o(lsu_wdata_cap),  // to load store unit
+    .lsu_wcap_o     (lsu_wcap), // to load store unit
+    .lsu_req_done_i (lsu_req_done),  // from load store unit
+    .lsu_mem_auth_cap_o(lsu_mem_auth_cap), // to CHERI checker
+    .lsu_auth_addr_o    (lsu_auth_addr),
+    .lsu_add_auth_addr_o(lsu_add_auth_addr),
 
     .lsu_addr_incr_req_i(lsu_addr_incr_req),
     .lsu_addr_last_i    (lsu_addr_last),
@@ -592,6 +736,9 @@ module ibex_core import ibex_pkg::*; #(
     .lsu_load_err_i     (lsu_load_err),
     .lsu_load_intg_err_i(lsu_load_intg_err),
     .lsu_store_err_i    (lsu_store_err),
+    .lsu_load_misalign_err_i (lsu_load_misalign_err),
+    .lsu_store_misalign_err_i(lsu_store_misalign_err),
+    .lsu_cheri_err_i    (lsu_cheri_err),
 
     // Interrupt Signals
     .csr_mstatus_mie_i(csr_mstatus_mie),
@@ -615,20 +762,26 @@ module ibex_core import ibex_pkg::*; #(
     .csr_rdata_i(csr_rdata),
 
     .rf_raddr_a_o      (rf_raddr_a),
-    .rf_rdata_a_i      (rf_rdata_a),
+    .rf_rdata_a_cap_i  (rf_rdata_a_cap),
+    .rf_rdata_a_int_i  (rf_rdata_a_int),
     .rf_raddr_b_o      (rf_raddr_b),
-    .rf_rdata_b_i      (rf_rdata_b),
+    .rf_rdata_b_cap_i  (rf_rdata_b_cap),
+    .rf_rdata_b_int_i  (rf_rdata_b_int),
     .rf_ren_a_o        (rf_ren_a),
     .rf_ren_b_o        (rf_ren_b),
     .rf_waddr_id_o     (rf_waddr_id),
-    .rf_wdata_id_o     (rf_wdata_id),
+    .rf_wdata_cap_id_o (rf_wdata_cap_id),
+    .rf_wdata_int_id_o (rf_wdata_int_id),
     .rf_we_id_o        (rf_we_id),
+    .rf_wcap_id_o      (rf_wcap_id),
     .rf_rd_a_wb_match_o(rf_rd_a_wb_match),
     .rf_rd_b_wb_match_o(rf_rd_b_wb_match),
 
-    .rf_waddr_wb_i    (rf_waddr_wb),
-    .rf_wdata_fwd_wb_i(rf_wdata_fwd_wb),
-    .rf_write_wb_i    (rf_write_wb),
+    .rf_waddr_wb_i        (rf_waddr_wb),
+    .rf_wdata_cap_fwd_wb_i(rf_wdata_cap_fwd_wb),
+    .rf_wdata_int_fwd_wb_i(rf_wdata_int_fwd_wb),
+    .rf_wcap_fwd_wb_i     (rf_wcap_fwd_wb),
+    .rf_write_wb_i        (rf_write_wb),
 
     .en_wb_o               (en_wb),
     .instr_type_wb_o       (instr_type_wb),
@@ -638,6 +791,7 @@ module ibex_core import ibex_pkg::*; #(
     .outstanding_store_wb_i(outstanding_store_wb),
 
     // Performance Counters
+    .perf_xret_o      (perf_xret),
     .perf_jump_o      (perf_jump),
     .perf_branch_o    (perf_branch),
     .perf_tbranch_o   (perf_tbranch),
@@ -686,12 +840,29 @@ module ibex_core import ibex_pkg::*; #(
     .imd_val_d_o (imd_val_d_ex),
     .imd_val_q_i (imd_val_q_ex),
 
+    // CHERI ALU
+    .cheri_en_i             (cheri_en),
+    .cheri_base_opcode_i    (cheri_base_opcode),
+    .cheri_threeop_opcode_i (cheri_threeop_opcode),
+    .cheri_s_a_d_opcode_i   (cheri_s_a_d_opcode),
+    .cheri_alu_exc_only_i   (cheri_alu_exc_only),
+
+    .cheri_operand_a_i      (cheri_operand_a_ex),
+    .cheri_operand_b_i      (cheri_operand_b_ex),
+
+    .cheri_result_o         (cheri_result_ex),
+    .cheri_wrote_capability (cheri_wrote_cap_ex),
+
+    .cheri_exceptions_a_o(cheri_exceptions_a_ex),
+    .cheri_exceptions_b_o(cheri_exceptions_b_ex),
+
     // Outputs
     .alu_adder_result_ex_o(alu_adder_result_ex),  // to LSU
-    .result_ex_o          (result_ex),  // to ID
+    .result_ex_o          (result_ex),            // to ID
 
-    .branch_target_o  (branch_target_ex),  // to IF
-    .branch_decision_o(branch_decision),  // to ID
+    .branch_target_int_o(branch_target_int_ex),  // to IF
+    .branch_decision_o  (branch_decision),       // to ID
+    .branch_is_cap_o    (branch_is_cap),
 
     .ex_valid_o(ex_valid)
   );
@@ -701,7 +872,7 @@ module ibex_core import ibex_pkg::*; #(
   /////////////////////
 
   assign data_req_o   = data_req_out & ~pmp_req_err[PMP_D];
-  assign lsu_resp_err = lsu_load_err | lsu_store_err;
+  assign lsu_resp_err = lsu_load_err | lsu_store_err | lsu_load_misalign_err | lsu_store_misalign_err;
 
   ibex_load_store_unit #(
     .MemECC(MemECC),
@@ -716,25 +887,33 @@ module ibex_core import ibex_pkg::*; #(
     .data_rvalid_i (data_rvalid_i),
     .data_bus_err_i(data_err_i),
     .data_pmp_err_i(pmp_req_err[PMP_D]),
+    .cheri_err_info_i(cheri_exceptions_lsu),
 
-    .data_addr_o      (data_addr_o),
-    .data_we_o        (data_we_o),
-    .data_be_o        (data_be_o),
-    .data_wdata_o     (data_wdata_o),
-    .data_rdata_i     (data_rdata_i),
+    .data_addr_o        (data_addr_o),
+    .data_we_o          (data_we_o),
+    .data_be_o          (data_be_o),
+    .data_wdata_o       (data_wdata_o),
+    .data_rdata_i       (data_rdata_i),
+    .data_first_access_o(lsu_data_first_access),
 
     // signals to/from ID/EX stage
-    .lsu_we_i      (lsu_we),
-    .lsu_type_i    (lsu_type),
-    .lsu_wdata_i   (lsu_wdata),
-    .lsu_sign_ext_i(lsu_sign_ext),
+    .lsu_we_i       (lsu_we),
+    .lsu_type_i     (lsu_type),
+    .lsu_wdata_int_i(lsu_wdata_int),
+    .lsu_wdata_cap_i(lsu_wdata_cap),
+    .lsu_wcap_i     (lsu_wcap),
+    .lsu_sign_ext_i (lsu_sign_ext),
 
-    .lsu_rdata_o      (rf_wdata_lsu),
+    .lsu_rdata_cap_o  (rf_wdata_cap_lsu),
+    .lsu_rdata_int_o  (rf_wdata_int_lsu),
     .lsu_rdata_valid_o(rf_we_lsu),
+    .lsu_rcap_o       (rf_wcap_lsu),
     .lsu_req_i        (lsu_req),
     .lsu_req_done_o   (lsu_req_done),
 
     .adder_result_ex_i(alu_adder_result_ex),
+    .auth_addr_i      (lsu_auth_addr),
+    .add_auth_addr_i  (lsu_add_auth_addr),
 
     .addr_incr_req_o(lsu_addr_incr_req),
     .addr_last_o    (lsu_addr_last),
@@ -746,6 +925,10 @@ module ibex_core import ibex_pkg::*; #(
     .load_err_o     (lsu_load_err),
     .store_err_o    (lsu_store_err),
     .load_intg_err_o(lsu_load_intg_err),
+    .load_misalign_err_o (lsu_load_misalign_err),
+    .store_misalign_err_o(lsu_store_misalign_err),
+    .cheri_err_o         (lsu_cheri_err),
+    .cheri_err_info_o    (cheri_exceptions_lsu_to_ctrl),
 
     .busy_o(lsu_busy),
 
@@ -762,6 +945,7 @@ module ibex_core import ibex_pkg::*; #(
     .en_wb_i                 (en_wb),
     .instr_type_wb_i         (instr_type_wb),
     .pc_id_i                 (pc_id),
+    .pcc_id_i                (pcc_id),
     .instr_is_compressed_id_i(instr_is_compressed_id),
     .instr_perf_count_id_i   (instr_perf_count_id),
 
@@ -770,23 +954,32 @@ module ibex_core import ibex_pkg::*; #(
     .outstanding_load_wb_o              (outstanding_load_wb),
     .outstanding_store_wb_o             (outstanding_store_wb),
     .pc_wb_o                            (pc_wb),
+    .pcc_wb_o                           (pcc_wb),
     .perf_instr_ret_wb_o                (perf_instr_ret_wb),
     .perf_instr_ret_compressed_wb_o     (perf_instr_ret_compressed_wb),
     .perf_instr_ret_wb_spec_o           (perf_instr_ret_wb_spec),
     .perf_instr_ret_compressed_wb_spec_o(perf_instr_ret_compressed_wb_spec),
 
-    .rf_waddr_id_i(rf_waddr_id),
-    .rf_wdata_id_i(rf_wdata_id),
-    .rf_we_id_i   (rf_we_id),
+    .rf_waddr_id_i    (rf_waddr_id),
+    .rf_wdata_cap_id_i(rf_wdata_cap_id),
+    .rf_wdata_int_id_i(rf_wdata_int_id),
+    .rf_we_id_i       (rf_we_id),
+    .rf_wcap_id_i     (rf_wcap_id),
 
-    .rf_wdata_lsu_i(rf_wdata_lsu),
-    .rf_we_lsu_i   (rf_we_lsu),
+    .rf_wdata_cap_lsu_i(rf_wdata_cap_lsu),
+    .rf_wdata_int_lsu_i(rf_wdata_int_lsu),
+    .rf_we_lsu_i       (rf_we_lsu),
+    .rf_wcap_lsu_i     (rf_wcap_lsu),
 
-    .rf_wdata_fwd_wb_o(rf_wdata_fwd_wb),
+    .rf_wdata_cap_fwd_wb_o(rf_wdata_cap_fwd_wb),
+    .rf_wdata_int_fwd_wb_o(rf_wdata_int_fwd_wb),
+    .rf_wcap_fwd_wb_o     (rf_wcap_fwd_wb),
 
-    .rf_waddr_wb_o(rf_waddr_wb),
-    .rf_wdata_wb_o(rf_wdata_wb),
-    .rf_we_wb_o   (rf_we_wb),
+    .rf_waddr_wb_o    (rf_waddr_wb),
+    .rf_wdata_cap_wb_o(rf_wdata_cap_wb),
+    .rf_wdata_int_wb_o(rf_wdata_int_wb),
+    .rf_we_wb_o       (rf_we_wb),
+    .rf_wcap_wb_o     (rf_wcap_wb),
 
     .lsu_resp_valid_i(lsu_resp_valid),
     .lsu_resp_err_i  (lsu_resp_err),
@@ -805,6 +998,9 @@ module ibex_core import ibex_pkg::*; #(
   assign rf_raddr_b_o     = rf_raddr_b;
 
   if (RegFileECC) begin : gen_regfile_ecc
+    // TODO  CHERI with ECC?
+    // for now the changes made here are just to get the system to compile;
+    // currently there is no implementation of CHERI with ECC
 
     // SEC_CM: DATA_REG_SW.INTEGRITY
     logic [1:0] rf_ecc_err_a, rf_ecc_err_b;
@@ -812,8 +1008,8 @@ module ibex_core import ibex_pkg::*; #(
 
     // ECC checkbit generation for regiter file wdata
     prim_secded_inv_39_32_enc regfile_ecc_enc (
-      .data_i(rf_wdata_wb),
-      .data_o(rf_wdata_wb_ecc_o)
+      .data_i(rf_wdata_int_wb),
+      .data_o(rf_wdata_wb_ecc_o[31:0]) // TODO fix this
     );
 
     // ECC checking on register file rdata
@@ -831,8 +1027,9 @@ module ibex_core import ibex_pkg::*; #(
     );
 
     // Assign read outputs - no error correction, just trigger an alert
-    assign rf_rdata_a = rf_rdata_a_ecc_i[31:0];
-    assign rf_rdata_b = rf_rdata_b_ecc_i[31:0];
+    // TODO with CHERI this is not tested and probably does not work
+    assign rf_rdata_a_int = rf_rdata_a_ecc_i[31:0];
+    assign rf_rdata_b_int = rf_rdata_b_ecc_i[31:0];
 
     // Calculate errors - qualify with WB forwarding to avoid xprop into the alert signal
     assign rf_ecc_err_a_id = |rf_ecc_err_a & rf_ren_a & ~rf_rd_a_wb_match;
@@ -845,15 +1042,56 @@ module ibex_core import ibex_pkg::*; #(
     logic unused_rf_ren_a, unused_rf_ren_b;
     logic unused_rf_rd_a_wb_match, unused_rf_rd_b_wb_match;
 
+    logic [CheriCapWidth-1:0] rf_wdata_cap_wb_from_int;
+
     assign unused_rf_ren_a         = rf_ren_a;
     assign unused_rf_ren_b         = rf_ren_b;
     assign unused_rf_rd_a_wb_match = rf_rd_a_wb_match;
     assign unused_rf_rd_b_wb_match = rf_rd_b_wb_match;
-    assign rf_wdata_wb_ecc_o       = rf_wdata_wb;
-    assign rf_rdata_a              = rf_rdata_a_ecc_i;
-    assign rf_rdata_b              = rf_rdata_b_ecc_i;
+    assign rf_wdata_wb_ecc_o       = rf_wcap_wb ? rf_wdata_cap_wb : rf_wdata_cap_wb_from_int;
+    assign rf_rdata_a_cap          = rf_rdata_a_ecc_i;
+    assign rf_rdata_b_cap          = rf_rdata_b_ecc_i;
     assign rf_ecc_err_comb         = 1'b0;
+
+    // Instantiate capability modification modules
+    module_wrap64_nullWithAddr rf_wdata_wb_nullWithAddr (rf_wdata_int_wb, rf_wdata_cap_wb_from_int);
+    module_wrap64_getAddr      rf_rdata_a_getAddr       (rf_rdata_a_cap, rf_rdata_a_int);
+    module_wrap64_getAddr      rf_rdata_b_getAddr       (rf_rdata_b_cap, rf_rdata_b_int);
   end
+
+  ////////////////////////
+  // CHERI mem checkers //
+  ////////////////////////
+
+  ibex_cheri_memchecker #(
+    .DataMem      (1'b1),
+    .CheriCapWidth(CheriCapWidth)
+  ) cheri_data_memchecker_i (
+    .auth_cap_i         (lsu_mem_auth_cap),
+    .data_addr_i        (data_addr_o),
+    .data_we_i          (data_we_o),
+    .data_type_i        (lsu_type),
+    .data_be_i          (data_be_o),
+    .data_cap_i         (lsu_wcap),
+    .cheri_mem_exc_o    (cheri_exceptions_lsu),
+    .instr_upper_exc_o  (), // unused for data checker
+    .instr_upper_exc_2_o()  // unused for data checker
+  );
+
+  ibex_cheri_memchecker #(
+    .DataMem      (1'b0),
+    .CheriCapWidth(CheriCapWidth)
+  ) cheri_instr_memchecker_i (
+    .auth_cap_i         (instr_fetch_auth),
+    .data_addr_i        (instr_addr_o),
+    .data_we_i          (1'b0),
+    .data_type_i        (2'bX),  // unused for instruction checker
+    .data_be_i          (4'bX),  // unused for instruction checker
+    .data_cap_i         (1'b0), // no capability accesses via instruction interface
+    .cheri_mem_exc_o    (cheri_exceptions_instr),
+    .instr_upper_exc_o  (instr_upper_exc),
+    .instr_upper_exc_2_o(instr_upper_exc_2)
+  );
 
   ///////////////////////
   // Crash dump output //
@@ -929,7 +1167,9 @@ module ibex_core import ibex_pkg::*; #(
   /////////////////////////////////////////
 
   assign csr_wdata  = alu_operand_a_ex;
-  assign csr_addr   = csr_num_e'(csr_access ? alu_operand_b_ex[11:0] : 12'b0);
+  assign csr_addr   = csr_num_e'(csr_access ?   alu_operand_b_ex[11:0] : 12'b0);
+  assign scr_wdata  = cheri_operand_a_ex;
+  assign scr_addr   = scr_num_e'(scr_access ? cheri_operand_b_ex[11:0] : 12'b0);
 
   ibex_cs_registers #(
     .DbgTriggerEn     (DbgTriggerEn),
@@ -945,7 +1185,10 @@ module ibex_core import ibex_pkg::*; #(
     .PMPNumRegions    (PMPNumRegions),
     .RV32E            (RV32E),
     .RV32M            (RV32M),
-    .RV32B            (RV32B)
+    .RV32B            (RV32B),
+    .CheriCapWidth    (CheriCapWidth),
+    .CheriAlmightyCap (CheriAlmightyCap),
+    .CheriNullCap     (CheriNullCap)
   ) cs_registers_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
@@ -958,6 +1201,7 @@ module ibex_core import ibex_pkg::*; #(
     // mtvec
     .csr_mtvec_o     (csr_mtvec),
     .csr_mtvec_init_i(csr_mtvec_init),
+    .scr_mtcc_o      (scr_mtcc),
     .boot_addr_i     (boot_addr_i),
 
     // Interface to CSRs     ( SRAM like                    )
@@ -967,6 +1211,17 @@ module ibex_core import ibex_pkg::*; #(
     .csr_op_i    (csr_op),
     .csr_op_en_i (csr_op_en),
     .csr_rdata_o (csr_rdata),
+
+    // Interface to SCRs
+    .scr_access_i (scr_access),
+    .scr_addr_i   (scr_addr),
+    .scr_wdata_i  (scr_wdata),
+    .scr_op_i     (scr_op),
+    .scr_op_en_i  (scr_op_en),
+    .scr_rdata_o  (scr_rdata),
+
+    // SCR values
+    .scr_ddc_o    (scr_ddc),
 
     // Interrupt related control signals
     .irq_software_i   (irq_software_i),
@@ -979,6 +1234,7 @@ module ibex_core import ibex_pkg::*; #(
     .csr_mstatus_mie_o(csr_mstatus_mie),
     .csr_mstatus_tw_o (csr_mstatus_tw),
     .csr_mepc_o       (csr_mepc),
+    .scr_mepcc_o      (scr_mepcc),
     .csr_mtval_o      (crash_dump_mtval),
 
     // PMP
@@ -996,9 +1252,12 @@ module ibex_core import ibex_pkg::*; #(
     .debug_ebreaku_o    (debug_ebreaku),
     .trigger_match_o    (trigger_match),
 
-    .pc_if_i(pc_if),
-    .pc_id_i(pc_id),
-    .pc_wb_i(pc_wb),
+    .pc_if_i (pc_if),
+    .pcc_if_i(pcc_if),
+    .pc_id_i (pc_id),
+    .pcc_id_i(pcc_id),
+    .pc_wb_i (pc_wb),
+    .pcc_wb_i(pcc_wb),
 
     .data_ind_timing_o    (data_ind_timing),
     .dummy_instr_en_o     (dummy_instr_en),
@@ -1017,6 +1276,15 @@ module ibex_core import ibex_pkg::*; #(
     .csr_mcause_i      (exc_cause),
     .csr_mtval_i       (csr_mtval),
     .illegal_csr_insn_o(illegal_csr_insn_id),
+    .illegal_scr_insn_o(illegal_scr_insn_id),
+    .csr_no_asr_o      (csr_no_asr_id),
+    .scr_no_asr_o      (scr_no_asr_id),
+
+    // CHERI exception cause
+    .cheri_exc_cause_i  (cheri_exc_cause),
+    .cheri_exc_reg_sel_i(cheri_exc_reg_sel),
+    .reg_addr_a_i       (rf_raddr_a_o),
+    .reg_addr_b_i       (rf_raddr_b_o),
 
     .double_fault_seen_o,
 
@@ -1120,10 +1388,10 @@ module ibex_core import ibex_pkg::*; #(
   logic [31:0] rvfi_stage_pc_rdata  [RVFI_STAGES];
   logic [31:0] rvfi_stage_pc_wdata  [RVFI_STAGES];
   logic [31:0] rvfi_stage_mem_addr  [RVFI_STAGES];
-  logic [ 3:0] rvfi_stage_mem_rmask [RVFI_STAGES];
-  logic [ 3:0] rvfi_stage_mem_wmask [RVFI_STAGES];
-  logic [31:0] rvfi_stage_mem_rdata [RVFI_STAGES];
-  logic [31:0] rvfi_stage_mem_wdata [RVFI_STAGES];
+  logic [ 7:0] rvfi_stage_mem_rmask [RVFI_STAGES];
+  logic [ 7:0] rvfi_stage_mem_wmask [RVFI_STAGES];
+  logic [63:0] rvfi_stage_mem_rdata [RVFI_STAGES];
+  logic [63:0] rvfi_stage_mem_wdata [RVFI_STAGES];
 
   logic        rvfi_instr_new_wb;
   logic        rvfi_intr_d;
@@ -1148,11 +1416,11 @@ module ibex_core import ibex_pkg::*; #(
   logic [31:0] rvfi_rd_wdata_d;
   logic [31:0] rvfi_rd_wdata_q;
   logic        rvfi_rd_we_wb;
-  logic [3:0]  rvfi_mem_mask_int;
-  logic [31:0] rvfi_mem_rdata_d;
-  logic [31:0] rvfi_mem_rdata_q;
-  logic [31:0] rvfi_mem_wdata_d;
-  logic [31:0] rvfi_mem_wdata_q;
+  logic [7:0]  rvfi_mem_mask_int;
+  logic [63:0] rvfi_mem_rdata_d;
+  logic [63:0] rvfi_mem_rdata_q;
+  logic [63:0] rvfi_mem_wdata_d;
+  logic [63:0] rvfi_mem_wdata_q;
   logic [31:0] rvfi_mem_addr_d;
   logic [31:0] rvfi_mem_addr_q;
   logic        rvfi_trap_id;
@@ -1177,6 +1445,13 @@ module ibex_core import ibex_pkg::*; #(
   logic [63:0]     rvfi_ext_stage_mcycle       [RVFI_STAGES];
 
 
+  // rf_wdata_int_wb may not always track with rf_wdata_cap_wb.
+  // If we don't have RVFI we don't care about this, because the register file
+  // will write the capability, but RVFI needs to get the address of the actual
+  // capability that is written
+  // rf_wdata_int_from_cap_wb will hold the integer address of rf_wdata_cap_wb
+  logic [31:0]     rf_wdata_int_from_cap_wb;
+  module_wrap64_getAddr rf_int_from_cap (rf_wdata_cap_wb, rf_wdata_int_from_cap_wb);
 
   logic        rvfi_stage_valid_d   [RVFI_STAGES];
 
@@ -1197,7 +1472,11 @@ module ibex_core import ibex_pkg::*; #(
   assign rvfi_rd_addr   = rvfi_stage_rd_addr  [RVFI_STAGES-1];
   assign rvfi_rd_wdata  = rvfi_stage_rd_wdata [RVFI_STAGES-1];
   assign rvfi_pc_rdata  = rvfi_stage_pc_rdata [RVFI_STAGES-1];
-  assign rvfi_pc_wdata  = rvfi_stage_pc_wdata [RVFI_STAGES-1];
+  // if the PC was set but not by a jump/branch, then we only have the target
+  // PC the cycle after since the controller is in FLUSH state
+  // TODO this is tested for MRET and exceptions, but not with
+  // branch brediction
+  assign rvfi_pc_wdata  = pc_set && (pc_mux_id != PC_JUMP) ? if_pc_set_target : rvfi_stage_pc_wdata [RVFI_STAGES-1];
   assign rvfi_mem_addr  = rvfi_stage_mem_addr [RVFI_STAGES-1];
   assign rvfi_mem_rmask = rvfi_stage_mem_rmask[RVFI_STAGES-1];
   assign rvfi_mem_wmask = rvfi_stage_mem_wmask[RVFI_STAGES-1];
@@ -1205,7 +1484,8 @@ module ibex_core import ibex_pkg::*; #(
   assign rvfi_mem_wdata = rvfi_stage_mem_wdata[RVFI_STAGES-1];
 
   assign rvfi_rd_addr_wb  = rf_waddr_wb;
-  assign rvfi_rd_wdata_wb = rf_we_wb ? rf_wdata_wb : rf_wdata_lsu;
+  assign rvfi_rd_wdata_wb = rf_we_wb ? (rf_wcap_wb ? rf_wdata_int_from_cap_wb : rf_wdata_int_wb)
+                                     : rf_wdata_int_lsu;
   assign rvfi_rd_we_wb    = rf_we_wb | rf_we_lsu;
 
   always_comb begin
@@ -1396,9 +1676,9 @@ module ibex_core import ibex_pkg::*; #(
             rvfi_stage_rs2_addr[i]        <= rvfi_rs2_addr_d;
             rvfi_stage_rs3_addr[i]        <= rvfi_rs3_addr_d;
             rvfi_stage_pc_rdata[i]        <= pc_id;
-            rvfi_stage_pc_wdata[i]        <= pc_set ? branch_target_ex : pc_if;
+            rvfi_stage_pc_wdata[i]        <= pc_set ? if_pc_set_target : pc_if;
             rvfi_stage_mem_rmask[i]       <= rvfi_mem_mask_int;
-            rvfi_stage_mem_wmask[i]       <= data_we_o ? rvfi_mem_mask_int : 4'b0000;
+            rvfi_stage_mem_wmask[i]       <= data_we_o ? rvfi_mem_mask_int : 8'b0000_0000;
             rvfi_stage_rs1_rdata[i]       <= rvfi_rs1_data_d;
             rvfi_stage_rs2_rdata[i]       <= rvfi_rs2_data_d;
             rvfi_stage_rs3_rdata[i]       <= rvfi_rs3_data_d;
@@ -1452,12 +1732,18 @@ module ibex_core import ibex_pkg::*; #(
     end
   end
 
+  // CHERI module instantiations to convert the capabilities read/written by
+  // the LSU to their in-memory representation for RVFI
+  logic [64:0] lsu_rdata_mem_cap, lsu_wdata_mem_cap;
+  module_wrap64_toMem wdata_toMem(lsu_wdata_cap, lsu_wdata_mem_cap);
+  module_wrap64_toMem rdata_toMem(rf_wdata_cap_lsu, lsu_rdata_mem_cap);
 
   // Memory adddress/write data available first cycle of ld/st instruction from register read
   always_comb begin
     if (instr_first_cycle_id) begin
-      rvfi_mem_addr_d  = alu_adder_result_ex;
-      rvfi_mem_wdata_d = lsu_wdata;
+      rvfi_mem_addr_d  = alu_adder_result_ex + (lsu_add_auth_addr ? lsu_auth_addr : '0);
+      rvfi_mem_wdata_d = rvfi_mem_mask_int == 8'b1111_1111 ? lsu_wdata_mem_cap[63:0]
+                                                           : {32'h0, lsu_wdata_int};
     end else begin
       rvfi_mem_addr_d  = rvfi_mem_addr_q;
       rvfi_mem_wdata_d = rvfi_mem_wdata_q;
@@ -1467,7 +1753,8 @@ module ibex_core import ibex_pkg::*; #(
   // Capture read data from LSU when it becomes valid
   always_comb begin
     if (lsu_resp_valid) begin
-      rvfi_mem_rdata_d = rf_wdata_lsu;
+      rvfi_mem_rdata_d = rvfi_mem_mask_int == 8'b1111_1111 ? lsu_rdata_mem_cap[63:0]
+                                                           : {32'h0, rf_wdata_int_lsu};
     end else begin
       rvfi_mem_rdata_d = rvfi_mem_rdata_q;
     end
@@ -1487,10 +1774,10 @@ module ibex_core import ibex_pkg::*; #(
   // Byte enable based on data type
   always_comb begin
     unique case (lsu_type)
-      2'b00:   rvfi_mem_mask_int = 4'b1111;
-      2'b01:   rvfi_mem_mask_int = 4'b0011;
-      2'b10:   rvfi_mem_mask_int = 4'b0001;
-      default: rvfi_mem_mask_int = 4'b0000;
+      2'b00:   rvfi_mem_mask_int = 8'b0000_1111;
+      2'b01:   rvfi_mem_mask_int = 8'b0000_0011;
+      2'b10:   rvfi_mem_mask_int = 8'b0000_0001;
+      2'b11:   rvfi_mem_mask_int = 8'b1111_1111;
     endcase
   end
 
@@ -1598,6 +1885,9 @@ module ibex_core import ibex_pkg::*; #(
     end
   end
 
+  assign perf_xret_o = perf_xret;
+  assign perf_jump_o = perf_jump;
+  assign perf_tbranch_o = perf_tbranch;
 `else
   logic unused_instr_new_id, unused_instr_id_done, unused_instr_done_wb;
   assign unused_instr_id_done = instr_id_done;

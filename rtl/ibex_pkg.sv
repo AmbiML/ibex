@@ -64,6 +64,7 @@ package ibex_pkg;
     OPCODE_STORE    = 7'h23,
     OPCODE_OP       = 7'h33,
     OPCODE_LUI      = 7'h37,
+    OPCODE_CHERI    = 7'h5b,
     OPCODE_BRANCH   = 7'h63,
     OPCODE_JALR     = 7'h67,
     OPCODE_JAL      = 7'h6f,
@@ -192,6 +193,143 @@ package ibex_pkg;
     MD_OP_REM
   } md_op_e;
 
+  ///////////
+  // CHERI //
+  ///////////
+
+  typedef enum logic [2:0] {
+    THREE_OP         = 3'h0,
+    C_INC_OFFSET_IMM = 3'h1,
+    C_SET_BOUNDS_IMM = 3'h2
+  } cheri_base_opcode_e;
+
+  // THREE_OP instructions, which include three-operand instructions as well
+  // as two-operand instructions with an additional opcode
+  typedef enum logic [6:0] {
+    C_SPECIAL_RW       = 7'h01,
+    C_SET_BOUNDS       = 7'h08,
+    C_SET_BOUNDS_EXACT = 7'h09,
+    C_SEAL             = 7'h0B,
+    C_UNSEAL           = 7'h0C,
+    C_AND_PERM         = 7'h0D,
+    C_SET_FLAGS        = 7'h0E,
+    C_SET_OFFSET       = 7'h0F,
+    C_SET_ADDR         = 7'h10,
+    C_INC_OFFSET       = 7'h11,
+    C_TO_PTR           = 7'h12,
+    C_FROM_PTR         = 7'h13,
+    C_SUB              = 7'h14,
+    C_BUILD_CAP        = 7'h1D,
+    C_COPY_TYPE        = 7'h1E,
+    C_C_SEAL           = 7'h1F,
+    C_TEST_SUBSET      = 7'h20,
+    C_SET_EQUAL_EXACT  = 7'h21,
+    C_STORE            = 7'h7C,
+    C_LOAD             = 7'h7D,
+    C_INVOKE           = 7'h7E,
+    SOURCE_AND_DEST    = 7'h7F      // two-operand instructions
+  } cheri_threeop_funct7_e;
+
+  // Two-operand instruction opcodes
+  typedef enum logic [4:0] {
+    C_GET_PERM       = 5'h00,
+    C_GET_TYPE       = 5'h01,
+    C_GET_BASE       = 5'h02,
+    C_GET_LEN        = 5'h03,
+    C_GET_TAG        = 5'h04,
+    C_GET_SEALED     = 5'h05,
+    C_GET_OFFSET     = 5'h06,
+    C_GET_FLAGS      = 5'h07,
+    C_ROUND_REP_LEN  = 5'h08,
+    C_REP_ALIGN_MASK = 5'h09,
+    C_MOVE           = 5'h0A,
+    C_CLEAR_TAG      = 5'h0B,
+    C_JALR           = 5'h0C,
+    CLEAR            = 5'h0D,
+    C_CLEAR          = 5'h0E,
+    C_GET_ADDR       = 5'h0F,
+    C_FP_CLEAR       = 5'h10,
+    C_SEAL_ENTRY     = 5'h11,
+    ONE_OP           = 5'h1F    //unused
+  } cheri_s_a_d_funct5_e;
+
+  // Stores
+  typedef enum logic [4:0] {
+    SB_DDC = 5'h00,
+    SH_DDC = 5'h01,
+    SW_DDC = 5'h02,
+    SD_DDC = 5'h03,
+    SQ_DDC = 5'h04,
+    SB_CAP = 5'h08,
+    SH_CAP = 5'h09,
+    SW_CAP = 5'h0A,
+    SD_CAP = 5'h0B,
+    SQ_CAP = 5'h0C
+  } cheri_store_funct5_e;
+
+  // Loads
+  typedef enum logic [4:0] {
+    LB_DDC  = 5'h00,
+    LH_DDC  = 5'h01,
+    LW_DDC  = 5'h02,
+    LD_DDC  = 5'h03,
+    LBU_DDC = 5'h04,
+    LHU_DDC = 5'h05,
+    LWU_DDC = 5'h06,
+    LB_CAP  = 5'h08,
+    LH_CAP  = 5'h09,
+    LW_CAP  = 5'h0A,
+    LD_CAP  = 5'h0B,
+    LBU_CAP = 5'h0C,
+    LHU_CAP = 5'h0D,
+    LWU_CAP = 5'h0E,
+    LQ_DDC  = 5'h17,
+    LQ_CAP  = 5'h1F
+  } cheri_load_funct5_e;
+
+  typedef struct packed {
+    logic access_system_regs_violation;
+    logic tag_violation;
+    logic seal_violation;
+    logic type_violation;
+    logic permit_seal_violation;
+    logic permit_cinvoke_violation;
+    logic access_cinvoke_idc_violation;
+    logic permit_unseal_violation;
+    logic permit_set_cid_violation;
+    logic permit_execute_violation;
+    logic permit_load_violation;
+    logic permit_store_violation;
+    logic permit_load_capability_violation;
+    logic permit_store_capability_violation;
+    logic permit_store_local_capability_violation;
+    logic global_violation;
+    logic length_violation;
+    logic inexact_bounds_violation;
+    logic unaligned_base_violation;
+    logic software_defined_violation;
+  } cheri_exc_t;
+
+  // instruction-specific exceptions, not including length violation
+  typedef struct packed {
+    logic tag_violation;
+    logic seal_violation;
+    logic permit_execute_violation;
+  } cheri_instr_exc_t;
+
+  // TODO perhaps there is a better way of representing these
+  parameter int unsigned CheriKindWidth     = 7;
+  parameter int unsigned CheriOTypeWidth    = 4;
+  parameter int unsigned CheriPermsWidth    = 31;
+
+  parameter int unsigned CheriMaxOType      = 'hb;
+
+  parameter int unsigned PermitGlobalIndex  = 0;
+  parameter int unsigned PermitExecuteIndex = 1;
+  parameter int unsigned PermitSealIndex    = 7;
+  parameter int unsigned PermitCInvokeIndex = 8;
+  parameter int unsigned PermitUnsealIndex  = 9;
+  parameter int unsigned PermitAccessSysReg = 10;
 
   //////////////////////////////////
   // Control and status registers //
@@ -243,6 +381,14 @@ package ibex_pkg;
     OP_A_IMM
   } op_a_sel_e;
 
+  // CHERI Operand A selection
+  typedef enum logic [1:0] {
+    CHERI_OP_A_REG_CAP,
+    CHERI_OP_A_REG_DDC,
+    CHERI_OP_A_PCC,
+    CHERI_OP_A_FWD
+  } c_op_a_sel_e;
+
   // Immediate a selection
   typedef enum logic {
     IMM_A_Z,
@@ -255,6 +401,14 @@ package ibex_pkg;
     OP_B_IMM
   } op_b_sel_e;
 
+  // CHERI Operand B selection
+  typedef enum logic [1:0] {
+    CHERI_OP_B_REG_CAP,
+    CHERI_OP_B_REG_DDC,
+    CHERI_OP_B_PCC,
+    CHERI_OP_B_IMM
+  } c_op_b_sel_e;
+
   // Immediate b selection
   typedef enum logic [2:0] {
     IMM_B_I,
@@ -263,13 +417,27 @@ package ibex_pkg;
     IMM_B_U,
     IMM_B_J,
     IMM_B_INCR_PC,
-    IMM_B_INCR_ADDR
+    IMM_B_INCR_ADDR,
+    IMM_B_ZERO
   } imm_b_sel_e;
 
+  // CHERI Immediate B selection
+  typedef enum logic [2:0] {
+    CHERI_IMM_B_I,
+    CHERI_IMM_B_S,
+    CHERI_IMM_B_U,
+    CHERI_IMM_B_INCR_PC,
+    CHERI_IMM_B_RS2,
+    CHERI_IMM_B_ZERO,
+    CHERI_IMM_B_TWO,
+    CHERI_IMM_B_J
+  } c_imm_b_sel_e;
+
   // Regfile write data selection
-  typedef enum logic {
+  typedef enum logic [1:0] {
     RF_WD_EX,
-    RF_WD_CSR
+    RF_WD_CSR, // also covers CHERI SCRs
+    RF_WD_CHERI
   } rf_wd_sel_e;
 
   // Controller FSM state encoding
@@ -340,14 +508,21 @@ package ibex_pkg;
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd02};
   localparam exc_cause_t ExcCauseBreakpoint =
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd03};
+  localparam exc_cause_t ExcCauseLoadAddrMisalign =
+    '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd04};
   localparam exc_cause_t ExcCauseLoadAccessFault  =
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd05};
+  localparam exc_cause_t ExcCauseStoreAddrMisalign =
+    '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd06};
   localparam exc_cause_t ExcCauseStoreAccessFault =
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd07};
   localparam exc_cause_t ExcCauseEcallUMode =
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd08};
   localparam exc_cause_t ExcCauseEcallMMode =
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd11};
+
+  localparam exc_cause_t ExcCauseCheri=
+    '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'h1C};
 
   // Internal NMI cause
   typedef enum logic [4:0] {
@@ -362,6 +537,43 @@ package ibex_pkg;
     DBG_CAUSE_HALTREQ = 3'h3,
     DBG_CAUSE_STEP    = 3'h4
   } dbg_cause_e;
+
+  // CHERI cause
+  typedef enum logic [4:0] {
+    CAUSE_NONE                                     = 5'h00,
+    CAUSE_LENGTH_VIOLATION                         = 5'h01,
+    CAUSE_TAG_VIOLATION                            = 5'h02,
+    CAUSE_SEAL_VIOLATION                           = 5'h03,
+    CAUSE_TYPE_VIOLATION                           = 5'h04,
+    // 'h05...'h07 reserved
+    CAUSE_SOFTWARE_DEFINED_PERMISSION_VIOLATION    = 5'h08,
+    // 'h09 deprecated in RISC-V
+    CAUSE_REPRESENTABILITY_VIOLATION               = 5'h0A,
+    CAUSE_UNALIGNED_BASE_VIOLATION                 = 5'h0B,
+    // 'h0C..'h0F reserved
+    CAUSE_GLOBAL_VIOLATION                         = 5'h10,
+    CAUSE_PERMIT_EXECUTE_VIOLATION                 = 5'h11,
+    CAUSE_PERMIT_LOAD_VIOLATION                    = 5'h12,
+    CAUSE_PERMIT_STORE_VIOLATION                   = 5'h13,
+    CAUSE_PERMIT_LOAD_CAPABILITY_VIOLATION         = 5'h14,
+    CAUSE_PERMIT_STORE_CAPABILITY_VIOLATION        = 5'h15,
+    CAUSE_PERMIT_STORE_LOCAL_CAPABILITY_VIOLATION  = 5'h16,
+    CAUSE_PERMIT_SEAL_VIOLATION                    = 5'h17,
+    CAUSE_PERMIT_ACCESS_SYSTEM_REGISTERS_VIOLATION = 5'h18,
+    CAUSE_PERMIT_CINVOKE_VIOLATION                 = 5'h19,
+    CAUSE_PERMIT_ACCESS_CINVOKE_IDC_VIOLATION      = 5'h1A,
+    CAUSE_PERMIT_UNSEAL_VIOLATION                  = 5'h1B,
+    CAUSE_PERMIT_SET_CID_VIOLATION                 = 5'h1C
+    // 'h1C..'h1F reserved
+  } c_exc_cause_e;
+
+  // Which register caused the CHERI exception
+  typedef enum logic [2:0] {
+    REG_A,
+    REG_B,
+    REG_SCR,
+    REG_PCC
+  } c_exc_reg_mux_sel_e;
 
   // ICache constants
   parameter int unsigned ADDR_W           = 32;
@@ -486,6 +698,11 @@ package ibex_pkg;
     CSR_DSCRATCH0 = 12'h7b2, // optional
     CSR_DSCRATCH1 = 12'h7b3, // optional
 
+    // CHERI CSRs
+    CSR_UCCSR = 12'h8C0,
+    CSR_SCCSR = 12'h9C0,
+    CSR_MCCSR = 12'hBC0,
+
     // Machine Counter/Timers
     CSR_MCOUNTINHIBIT  = 12'h320,
     CSR_MHPMEVENT3     = 12'h323,
@@ -582,6 +799,25 @@ package ibex_pkg;
     CSR_CPUCTRL        = 12'h7C0,
     CSR_SECURESEED     = 12'h7C1
   } csr_num_e;
+
+  // CHERI SCR
+  typedef enum logic [4:0] {
+    SCR_PCC       = 5'h00,
+    SCR_DDC       = 5'h01,
+    SCR_MTCC      = 5'h1C,
+    SCR_MTDC      = 5'h1D,
+    SCR_MSCRATCHC = 5'h1E,
+    SCR_MEPCC     = 5'h1F
+  } scr_num_e;
+
+  // CHERI SCR operations
+  // bit 0 is WRITE, bit 1 is READ
+  typedef enum logic [1:0] {
+    SCR_NONE      = 2'b00,
+    SCR_WRITE     = 2'b01,
+    SCR_READ      = 2'b10,
+    SCR_READWRITE = 2'b11
+  } scr_op_e;
 
   // CSR pmp-related offsets
   parameter logic [11:0] CSR_OFF_PMP_CFG  = 12'h3A0; // pmp_cfg  @ 12'h3a0 - 12'h3a3

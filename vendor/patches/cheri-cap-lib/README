@@ -1,0 +1,8 @@
+The patch here does not seem to be correctly applied by the vendor script, but
+can still be applied by running
+
+patch -p1 < ../patches/cheri-cap-lib/0001-add-core-file.patch
+
+inside the cheri-cap-lib directory within the vendor directory
+(ie inside ibex/vendor/cheri-cap-lib).
+

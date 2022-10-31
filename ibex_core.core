@@ -14,9 +14,12 @@ filesets:
       - lowrisc:ibex:ibex_pkg
       - lowrisc:ibex:ibex_icache
       - lowrisc:dv:dv_fcov_macros
+      - ucam:cheri:cheri-cap-lib-verilog-wrappers
     files:
       - rtl/ibex_alu.sv
       - rtl/ibex_branch_predict.sv
+      - rtl/ibex_cheri_alu.sv
+      - rtl/ibex_cheri_memchecker.sv
       - rtl/ibex_compressed_decoder.sv
       - rtl/ibex_controller.sv
       - rtl/ibex_cs_registers.sv
@@ -165,6 +168,12 @@ parameters:
     paramtype: vlogparam
     default: 40
     description: Bit width of performance monitor event counters [32/64]
+
+  TestRIG:
+    datatype: int
+    paramtype: vlogparam
+    default: 0
+    description: "Whether TestRIG support should be enabled"
 
 targets:
   default: &default_target

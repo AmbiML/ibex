@@ -426,6 +426,10 @@ module ibex_lockstep import ibex_pkg::*; #(
     .rvfi_ext_nmi       (),
     .rvfi_ext_debug_req (),
     .rvfi_ext_mcycle    (),
+    .perf_xret_o        (),
+    .perf_jump_o        (),
+    .perf_tbranch_o     (),
+    .perf_if_cheri_err_o(),
 `endif
 
     .fetch_enable_i         (shadow_inputs_q[0].fetch_enable),

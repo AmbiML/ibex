@@ -1,0 +1,36 @@
+diff --git a/CHERICapWrap.bsv b/CHERICapWrap.bsv
+index 0c5402a..78caf08 100644
+--- a/CHERICapWrap.bsv
++++ b/CHERICapWrap.bsv
+@@ -95,5 +95,11 @@ function Bool `W(validAsType) (`CAPTYPE dummy, Bit#(CapAddrW) checkType) = valid
+ function `CAPTYPE `W(fromMem) (Tuple2#(Bool, Bit#(CapW)) mem_cap) = fromMem(mem_cap);
+ (* noinline *)
+ function Tuple2#(Bool, Bit#(CapW)) `W(toMem) (`CAPTYPE cap) = toMem(cap);
++(* noinline *)
++function Bit#(CapAddrW) `W(getRepresentableAlignmentMask) (`CAPTYPE dummy, Bit#(CapAddrW) length) = getRepresentableAlignmentMask(dummy, length);
++(* noinline *)
++function Bit#(CapAddrW) `W(getRepresentableLength) (`CAPTYPE dummy, Bit#(CapAddrW) length) = getRepresentableLength(dummy, length);
++(* noinline *)
++function Bit#(2) `W(getBaseAlignment) (`CAPTYPE cap) = getBaseAlignment(cap);
+ 
+ endpackage
+diff --git a/cheri-cap-lib-verilog-wrappers.core b/cheri-cap-lib-verilog-wrappers.core
+index 7c938a4..2e36b3e 100644
+--- a/cheri-cap-lib-verilog-wrappers.core
++++ b/cheri-cap-lib-verilog-wrappers.core
+@@ -9,12 +9,15 @@ filesets:
+       - module_wrap64_fromMem.v
+       - module_wrap64_getAddr.v
+       - module_wrap64_getBase.v
++      - module_wrap64_getBaseAlignment.v
+       - module_wrap64_getFlags.v
+       - module_wrap64_getHardPerms.v
+       - module_wrap64_getKind.v
+       - module_wrap64_getLength.v
+       - module_wrap64_getOffset.v
+       - module_wrap64_getPerms.v
++      - module_wrap64_getRepresentableAlignmentMask.v
++      - module_wrap64_getRepresentableLength.v
+       - module_wrap64_getSoftPerms.v
+       - module_wrap64_getTop.v
+       - module_wrap64_incOffset.v

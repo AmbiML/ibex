@@ -11,7 +11,8 @@
 module ibex_ex_block #(
   parameter ibex_pkg::rv32m_e RV32M           = ibex_pkg::RV32MFast,
   parameter ibex_pkg::rv32b_e RV32B           = ibex_pkg::RV32BNone,
-  parameter bit               BranchTargetALU = 0
+  parameter bit               BranchTargetALU = 0,
+  parameter int unsigned      CheriCapWidth   = 91
 ) (
   input  logic                  clk_i,
   input  logic                  rst_ni,
@@ -44,13 +45,31 @@ module ibex_ex_block #(
   output logic [33:0]           imd_val_d_o[2],
   input  logic [33:0]           imd_val_q_i[2],
 
-  // Outputs
-  output logic [31:0]           alu_adder_result_ex_o, // to LSU
-  output logic [31:0]           result_ex_o,
-  output logic [31:0]           branch_target_o,       // to IF
-  output logic                  branch_decision_o,     // to ID
+  // CHERI ALU
+  input logic cheri_en_i,
 
-  output logic                  ex_valid_o             // EX has valid output
+  input ibex_pkg::cheri_base_opcode_e    cheri_base_opcode_i,
+  input ibex_pkg::cheri_threeop_funct7_e cheri_threeop_opcode_i,
+  input ibex_pkg::cheri_s_a_d_funct5_e   cheri_s_a_d_opcode_i,
+  input logic                            cheri_alu_exc_only_i,
+
+  input logic [CheriCapWidth-1:0] cheri_operand_a_i,
+  input logic [CheriCapWidth-1:0] cheri_operand_b_i,
+
+  output logic [CheriCapWidth-1:0] cheri_result_o,
+  output logic cheri_wrote_capability,
+
+  output ibex_pkg::cheri_exc_t cheri_exceptions_a_o,
+  output ibex_pkg::cheri_exc_t cheri_exceptions_b_o,
+
+  // Outputs
+  output logic [31:0]              alu_adder_result_ex_o, // to LSU
+  output logic [31:0]              result_ex_o,
+  output logic [31:0]              branch_target_int_o,   // to IF
+  output logic                     branch_decision_o,     // to ID
+  output logic                     branch_is_cap_o,
+
+  output logic                     ex_valid_o             // EX has valid output
 );
 
   import ibex_pkg::*;
@@ -68,6 +87,25 @@ module ibex_ex_block #(
   logic [33:0] multdiv_imd_val_d[2];
   logic [ 1:0] multdiv_imd_val_we;
 
+  // signals between the CHERI ALU and the integer ALU
+  // This is in the always_comb block inside the CHERI ALU using the output of
+  // some other modules and its result is then used as an input to modules
+  // within the same always_comb, which generates these verilator warnings,
+  // so the warnings are silenced here
+  // verilator lint_off UNOPTFLAT
+  // verilator lint_off IMPERFECTSCH
+  logic [31:0] cheri_int_alu_operand_a;
+  // verilator lint_on IMPERFECTSCH
+  // verilator lint_on UNOPTFLAT
+  logic [31:0] cheri_int_alu_operand_b;
+  alu_op_e     cheri_int_alu_operator;
+
+  alu_op_e     alu_operator;
+  logic [31:0] alu_operand_a;
+  logic [31:0] alu_operand_b;
+
+  logic [31:0] branch_target;
+
   /*
     The multdiv_i output is never selected if RV32M=RV32MNone
     At synthesis time, all the combinational and sequential logic
@@ -84,6 +122,11 @@ module ibex_ex_block #(
   assign imd_val_d_o[1] = multdiv_sel ? multdiv_imd_val_d[1] : {2'b0, alu_imd_val_d[1]};
   assign imd_val_we_o   = multdiv_sel ? multdiv_imd_val_we : alu_imd_val_we;
 
+  // Mux CHERI ALU outputs and ID stage inputs
+  assign alu_operator  = cheri_en_i == 1'b1 ? cheri_int_alu_operator  : alu_operator_i;
+  assign alu_operand_a = cheri_en_i == 1'b1 ? cheri_int_alu_operand_a : alu_operand_a_i;
+  assign alu_operand_b = cheri_en_i == 1'b1 ? cheri_int_alu_operand_b : alu_operand_b_i;
+
   assign alu_imd_val_q = '{imd_val_q_i[0][31:0], imd_val_q_i[1][31:0]};
 
   assign result_ex_o  = multdiv_sel ? multdiv_result : alu_result;
@@ -98,7 +141,7 @@ module ibex_ex_block #(
     assign bt_alu_result   = bt_a_operand_i + bt_b_operand_i;
 
     assign unused_bt_carry = bt_alu_result[32];
-    assign branch_target_o = bt_alu_result[31:0];
+    assign branch_target   = bt_alu_result[31:0];
   end else begin : g_no_branch_target_alu
     // Unused bt_operand signals cause lint errors, this avoids them
     logic [31:0] unused_bt_a_operand, unused_bt_b_operand;
@@ -106,8 +149,11 @@ module ibex_ex_block #(
     assign unused_bt_a_operand = bt_a_operand_i;
     assign unused_bt_b_operand = bt_b_operand_i;
 
-    assign branch_target_o = alu_adder_result_ex_o;
+    assign branch_target = alu_adder_result_ex_o;
   end
+
+  assign branch_target_int_o = branch_target;
+  assign branch_is_cap_o = cheri_en_i;
 
   /////////
   // ALU //
@@ -116,9 +162,9 @@ module ibex_ex_block #(
   ibex_alu #(
     .RV32B(RV32B)
   ) alu_i (
-    .operator_i         (alu_operator_i),
-    .operand_a_i        (alu_operand_a_i),
-    .operand_b_i        (alu_operand_b_i),
+    .operator_i         (alu_operator),
+    .operand_a_i        (alu_operand_a),
+    .operand_b_i        (alu_operand_b),
     .instr_first_cycle_i(alu_instr_first_cycle_i),
     .imd_val_q_i        (alu_imd_val_q),
     .imd_val_we_o       (alu_imd_val_we),
@@ -195,5 +241,34 @@ module ibex_ex_block #(
   // unless the intermediate result register is being written (which indicates this isn't the
   // final cycle of ALU operation).
   assign ex_valid_o = multdiv_sel ? multdiv_valid : ~(|alu_imd_val_we);
+
+  ///////////////
+  // CHERI ALU //
+  ///////////////
+  ibex_cheri_alu #(
+    .CheriCapWidth(CheriCapWidth)
+  ) cheri_alu_i (
+    .base_opcode_i    (cheri_base_opcode_i),
+    .threeop_opcode_i (cheri_threeop_opcode_i),
+    .s_a_d_opcode_i   (cheri_s_a_d_opcode_i),
+    .exc_only_i       (cheri_alu_exc_only_i),
+    .instr_first_cycle_i(alu_instr_first_cycle_i),
+
+    .operand_a_i   (cheri_operand_a_i),
+    .operand_b_i   (cheri_operand_b_i),
+
+    .alu_operand_a_o(cheri_int_alu_operand_a),
+    .alu_operand_b_o(cheri_int_alu_operand_b),
+    .alu_operator_o (cheri_int_alu_operator),
+    .alu_result_i   (alu_adder_result_ext[33:1]),
+    .btalu_result_i (branch_target),
+
+    .result_o        (cheri_result_o),
+    .wrote_capability(cheri_wrote_capability),
+
+    .exceptions_a_o (cheri_exceptions_a_o),
+    .exceptions_b_o (cheri_exceptions_b_o)
+  );
+
 
 endmodule
